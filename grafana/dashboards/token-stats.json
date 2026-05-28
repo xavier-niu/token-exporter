@@ -195,7 +195,7 @@
     {
       "title": "Cache Hit Rate",
       "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 21 },
       "options": {
         "tooltip": { "mode": "multi", "sort": "desc" },
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "hideZero": true, "hideEmpty": true }
@@ -329,13 +329,20 @@
     },
     {
       "title": "Cost by Model",
-      "type": "piechart",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 21 },
+      "type": "bargauge",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 12 },
       "options": {
-        "legend": { "displayMode": "list", "placement": "right", "showLegend": true, "values": ["percent"], "hideZero": true, "hideEmpty": true },
-        "tooltip": { "mode": "multi", "sort": "desc", "showPercent": true },
-        "reduceOptions": { "calcs": ["lastNotNull"] },
-        "pieType": "donut"
+        "displayMode": "basic",
+        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "maxVizHeight": 30,
+        "minVizHeight": 30,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": false,
+        "sizing": "manual",
+        "valueMode": "color"
       },
       "targets": [
         {
@@ -348,6 +355,7 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
+          "min": 0,
           "unit": "currencyUSD",
           "decimals": 4
         },
