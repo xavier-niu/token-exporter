@@ -11,6 +11,16 @@ import pricing
 logger = logging.getLogger("token-stats")
 
 
+def _utcnow() -> datetime:
+    """Current UTC time, indirected so tests can freeze "now".
+
+    The collectors derive their scan window (since = now - days_back) from this,
+    so patching it lets a fixture with fixed dates exercise the date-window
+    filtering deterministically.
+    """
+    return datetime.now(timezone.utc)
+
+
 def _detect_agent(base_dir: str) -> str:
     """Detect agent type from the base directory path."""
     if base_dir.endswith("/.codex") or "/.codex/" in base_dir:
@@ -489,7 +499,7 @@ class CcusageCollector:
 
     def scan_history(self):
         """Scan all configured directories and emit records."""
-        since = (datetime.now(timezone.utc) - timedelta(days=self.days_back)).date()
+        since = (_utcnow() - timedelta(days=self.days_back)).date()
         _prune_stale_totals(self._last_totals, since)
         total_records = 0
         for claude_dir in self.claude_dirs:
@@ -543,7 +553,7 @@ class CodexCollector:
 
     def scan_history(self):
         """Scan all configured Codex directories and emit records."""
-        since = (datetime.now(timezone.utc) - timedelta(days=self.days_back)).date()
+        since = (_utcnow() - timedelta(days=self.days_back)).date()
         _prune_stale_totals(self._last_totals, since)
         total_records = 0
         for codex_dir in self.codex_dirs:
