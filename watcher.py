@@ -43,9 +43,14 @@ def _extract_project(project_key: str) -> str:
 
 
 def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> dict | None:
-    """Run ccusage daily --json --offline --timezone <tz> --instances and return parsed JSON."""
+    """Run ccusage claude daily --json --offline --timezone <tz> --instances and return parsed JSON.
+
+    ccusage v20 split per-agent reporting into subcommands; the Claude Code
+    report (and the --instances per-project breakdown) now lives under
+    `ccusage claude daily` rather than the top-level `ccusage daily`.
+    """
     cmd = [
-        "ccusage", "daily", "--json", "--offline",
+        "ccusage", "claude", "daily", "--json", "--offline",
         "--timezone", timezone_name,
         "--instances",
         "--since", since.strftime("%Y%m%d"),
@@ -59,25 +64,6 @@ def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> di
         return json.loads(result.stdout)
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
         logger.error("ccusage error for %s: %s", claude_dir, e)
-        return None
-
-
-def _run_codex_usage(codex_dir: str, since: date, timezone_name: str = "UTC") -> dict | None:
-    """Run @ccusage/codex daily --json --offline --timezone <tz> and return parsed JSON."""
-    cmd = [
-        "npx", "@ccusage/codex", "daily", "--json", "--offline",
-        "--timezone", timezone_name,
-        "--since", since.strftime("%Y-%m-%d"),
-    ]
-    env = {**os.environ, "CODEX_HOME": codex_dir}
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
-        if result.returncode != 0:
-            logger.error("ccusage codex failed for %s: %s", codex_dir, result.stderr.strip())
-            return None
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error("ccusage codex error for %s: %s", codex_dir, e)
         return None
 
 
@@ -206,26 +192,6 @@ def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> d
 _TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
 
 
-def _parse_codex_usage_date(value: str) -> str:
-    """Return a stable YYYY-MM-DD date for @ccusage/codex daily output."""
-    if not value:
-        return ""
-
-    for fmt in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
-        try:
-            parsed = datetime.strptime(value, fmt)
-            return parsed.date().isoformat()
-        except ValueError:
-            pass
-
-    try:
-        parsed = datetime.fromisoformat(value)
-        return parsed.date().isoformat()
-    except ValueError:
-        logger.warning("Could not parse @ccusage/codex date: %s", value)
-        return value
-
-
 def _project_from_cwd(cwd: str) -> str:
     if not cwd:
         return "unknown"
@@ -342,67 +308,6 @@ def _scan_antcodex_dir(codex_dir: str, since: date, timezone_name: str = "UTC", 
         if entries:
             result["projects"][f"-home-user-developer-{project}"] = entries
     return result
-
-
-def _codex_model_breakdowns(entry: dict) -> list[dict]:
-    """Convert current @ccusage/codex models output into modelBreakdowns."""
-    if entry.get("modelBreakdowns"):
-        return entry["modelBreakdowns"]
-
-    models = entry.get("models")
-    if not isinstance(models, dict):
-        return []
-
-    total_cost = entry.get("costUSD", entry.get("totalCost", 0)) or 0
-    model_token_total = sum(
-        model.get("totalTokens", 0) or 0
-        for model in models.values()
-        if isinstance(model, dict)
-    )
-    breakdowns = []
-
-    for model_name, model in models.items():
-        if not isinstance(model, dict):
-            continue
-
-        raw_input = model.get("inputTokens", 0) or 0
-        cached_input = model.get("cachedInputTokens", 0) or 0
-        cache_creation = model.get("cacheCreationTokens", 0) or 0
-        total_tokens = model.get("totalTokens", 0) or 0
-        cost = model.get("costUSD", model.get("cost"))
-        if cost is None:
-            if len(models) == 1:
-                cost = total_cost
-            elif total_cost and model_token_total:
-                cost = total_cost * (total_tokens / model_token_total)
-            else:
-                cost = 0
-
-        breakdowns.append({
-            "modelName": model_name,
-            "inputTokens": max(raw_input - cached_input - cache_creation, 0),
-            "outputTokens": model.get("outputTokens", 0) or 0,
-            "cacheCreationTokens": cache_creation,
-            "cacheReadTokens": cached_input,
-            "cost": cost,
-        })
-
-    return breakdowns
-
-
-def _normalize_codex_usage_data(data: dict) -> dict:
-    """Normalize @ccusage/codex output before feeding the shared daily parser."""
-    if "daily" not in data:
-        return data
-
-    normalized = dict(data)
-    normalized["daily"] = []
-    for entry in data["daily"]:
-        normalized_entry = dict(entry)
-        normalized_entry["date"] = _parse_codex_usage_date(entry.get("date", ""))
-        normalized_entry["modelBreakdowns"] = _codex_model_breakdowns(entry)
-        normalized["daily"].append(normalized_entry)
-    return normalized
 
 
 def _load_last_totals(path: str) -> dict[tuple, dict]:
@@ -555,7 +460,12 @@ class CcusageCollector:
 
 
 class CodexCollector:
-    """Collects token usage from Codex data directories via @ccusage/codex CLI."""
+    """Collects token usage from Codex data directories.
+
+    Scans the session JSONL files directly (with cumulative-counter dedup) and
+    prices them via the shared LiteLLM-sourced pricing table, rather than
+    shelling out to a CLI.
+    """
 
     def __init__(self, codex_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC", pricing_rates: dict | None = None):
         self.codex_dirs = codex_dirs
@@ -570,7 +480,7 @@ class CodexCollector:
             logger.info("Loaded CodexCollector state from %s (%d entries)", state_file, len(self._last_totals))
 
     def scan_history(self):
-        """Run @ccusage/codex for all configured directories and emit records."""
+        """Scan all configured Codex directories and emit records."""
         since = (datetime.now(timezone.utc) - timedelta(days=self.days_back)).date()
         _prune_stale_totals(self._last_totals, since)
         total_records = 0
