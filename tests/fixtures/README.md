@@ -82,3 +82,20 @@ opus-4-8 regressing to $0 cost. It is **gated on the ccusage binary** and skips
 where ccusage isn't installed. The fixture includes a duplicate `message.id` +
 `requestId` line to exercise ccusage's dedup, and uses fixed dates scanned with
 an unbounded `days_back` (same rationale as `.codex/`).
+
+## `window/.codefuse/engine/cc/`
+
+A second antcc fixture, separate from `.codefuse/engine/cc/` so it doesn't
+perturb `TestAntccFixture`. Its assistant records span **2026-05-09 .. 05-17**,
+one per a few representative days, to exercise the `days_back` date-window
+filtering — which the other fixtures deliberately bypass by scanning with an
+unbounded window.
+
+`TestAntccWindowCrosscheck` patches `watcher._utcnow` to a frozen **2026-05-17**
+so `days_back=7` covers 2026-05-10..05-17; the 2026-05-09 record sits one day
+outside and must be dropped. It then runs the antcc crosscheck (collector vs. an
+independent manual dedup scan) hermetically — no live `ANTCC_DATA_DIR` and no
+ccusage needed, since antcc is parsed in-process — and also asserts hardcoded
+in-window totals so the boundary exclusion and the 05-10 streaming-dedup are
+both verified. The live-data `TestAntccCrosscheck` still skips without real
+data; this is its always-on hermetic counterpart.

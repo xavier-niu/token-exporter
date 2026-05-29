@@ -11,13 +11,19 @@ import subprocess
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import watcher
 from watcher import CcusageCollector, _detect_agent
 
-ANTCC_DATA_DIR = os.environ.get("ANTCC_DATA_DIR", os.path.expanduser("~/.codefuse/engine/cc"))
+# Committed antcc fixture, used by the crosscheck by default. antcc is parsed
+# in-process (no ccusage), so the crosscheck is hermetic. Point ANTCC_DATA_DIR at
+# a real ~/.codefuse/engine/cc to cross-check live history instead.
+ANTCC_FIXTURE_DIR = str(Path(__file__).parent / "fixtures" / ".codefuse" / "engine" / "cc")
+ANTCC_CROSSCHECK_DIR = os.environ.get("ANTCC_DATA_DIR") or ANTCC_FIXTURE_DIR
 
 
 def _ccusage_available():
@@ -27,16 +33,6 @@ def _ccusage_available():
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
-
-def _antcc_data_available():
-    projects_dir = os.path.join(ANTCC_DATA_DIR, "projects")
-    return os.path.isdir(projects_dir)
-
-
-skip_unless_integration = pytest.mark.skipif(
-    not (_ccusage_available() and _antcc_data_available()),
-    reason="ccusage not installed or ANTCC_DATA_DIR not found (set ANTCC_DATA_DIR to run)",
-)
 
 # Gated only on ccusage (no live data dependency): used by the committed
 # Claude-Code fixture below.
@@ -61,12 +57,35 @@ CLAUDE_FIXTURE_GROUND_TRUTH = {
         {"input_tokens": 1500, "output_tokens": 300, "cache_creation_tokens": 0, "cache_read_tokens": 700},
 }
 
+# Committed antcc fixture whose data spans 2026-05-09..2026-05-17. antcc is
+# parsed in-process (no ccusage), so this crosscheck runs hermetically instead
+# of skipping. With a frozen "today" of 2026-05-17 and days_back=7 the window
+# starts at 2026-05-10, so the 2026-05-09 record must be excluded.
+ANTCC_WINDOW_FIXTURE_DIR = str(
+    Path(__file__).parent / "fixtures" / "window" / ".codefuse" / "engine" / "cc"
+)
+ANTCC_WINDOW_TODAY = datetime(2026, 5, 17, 12, 0, tzinfo=timezone.utc)
+ANTCC_WINDOW_EXPECTED = {
+    "claude-opus-4-8": {
+        "input_tokens": 25,            # 5 (05-10) + 8 (05-13) + 12 (05-17)
+        "output_tokens": 90,           # 20 + 30 + 40
+        "cache_creation_tokens": 60,   # 50 + 0 + 10
+        "cache_read_tokens": 800,      # 100 + 300 + 400
+    }
+}
 
-def _manual_deduped_totals(days_back: int = 7, timezone_name: str = "UTC") -> dict:
-    """Manually scan JSONL files with msg_id dedup and return per-model totals."""
+
+def _manual_deduped_totals(days_back: int = 7, timezone_name: str = "UTC",
+                           base_dir: str = ANTCC_CROSSCHECK_DIR, now: datetime | None = None) -> dict:
+    """Manually scan JSONL files with msg_id dedup and return per-model totals.
+
+    `now` is injectable so a fixed-date fixture can be checked against a frozen
+    "today" (matching the collector's patched clock).
+    """
     tz = ZoneInfo(timezone_name)
-    since = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    projects_dir = os.path.join(ANTCC_DATA_DIR, "projects")
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    projects_dir = os.path.join(base_dir, "projects")
     totals = defaultdict(lambda: {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0, "cache_read_tokens": 0})
 
     for project_dir in Path(projects_dir).iterdir():
@@ -126,7 +145,8 @@ def _manual_deduped_totals(days_back: int = 7, timezone_name: str = "UTC") -> di
     return dict(totals)
 
 
-def _collector_model_totals(days_back: int, timezone_name: str = "UTC") -> dict:
+def _collector_model_totals(days_back: int, timezone_name: str = "UTC",
+                            base_dir: str = ANTCC_CROSSCHECK_DIR) -> dict:
     """Run CcusageCollector and return totals grouped by model."""
     totals = defaultdict(lambda: {
         "input_tokens": 0,
@@ -144,7 +164,7 @@ def _collector_model_totals(days_back: int, timezone_name: str = "UTC") -> dict:
         t["cache_read_tokens"] += record["cache_read_tokens"]
 
     collector = CcusageCollector(
-        claude_dirs=[ANTCC_DATA_DIR],
+        claude_dirs=[base_dir],
         days_back=days_back,
         on_record=on_record,
         timezone_name=timezone_name,
@@ -168,16 +188,49 @@ def _assert_totals_match(expected: dict, actual: dict, label: str = ""):
             )
 
 
-@skip_unless_integration
 class TestAntccCrosscheck:
-    """Verify CcusageCollector matches manual deduped JSONL scan for antcc data."""
+    """Verify CcusageCollector matches an independent manual dedup scan for
+    antcc data.
 
-    def test_totals_match_last_7_days(self):
-        """Last 7 days totals should match manual deduped scan."""
-        expected = _manual_deduped_totals(days_back=7)
-        actual = _collector_model_totals(days_back=7)
+    Runs against the committed antcc fixture by default, so it is hermetic and
+    always runs (antcc is parsed in-process; no ccusage, no live data). Set
+    ANTCC_DATA_DIR to point it at a real ~/.codefuse/engine/cc and cross-check
+    live history instead.
+    """
 
-        _assert_totals_match(expected, actual, label="7-day: ")
+    def test_collector_matches_manual_dedup_scan(self):
+        # Unbounded window so the fixture's fixed dates are all in range; the
+        # date-window filtering itself is covered by TestAntccWindowCrosscheck.
+        expected = _manual_deduped_totals(days_back=UNBOUNDED_DAYS_BACK, base_dir=ANTCC_CROSSCHECK_DIR)
+        actual = _collector_model_totals(days_back=UNBOUNDED_DAYS_BACK, base_dir=ANTCC_CROSSCHECK_DIR)
+
+        assert expected, f"no antcc usage found in {ANTCC_CROSSCHECK_DIR}"
+        _assert_totals_match(expected, actual)
+
+
+class TestAntccWindowCrosscheck:
+    """Run the antcc crosscheck against a committed 7-day fixture with a frozen
+    "today", instead of skipping when no live antcc data is present.
+
+    antcc is parsed in-process (no ccusage), so this is fully hermetic. Freezing
+    watcher._utcnow to 2026-05-17 makes days_back=7 cover 2026-05-10..05-17; the
+    2026-05-09 record falls outside the window and must be dropped.
+    """
+
+    def test_collector_matches_manual_scan_within_window(self):
+        with patch.object(watcher, "_utcnow", return_value=ANTCC_WINDOW_TODAY):
+            actual = _collector_model_totals(days_back=7, base_dir=ANTCC_WINDOW_FIXTURE_DIR)
+        expected = _manual_deduped_totals(
+            days_back=7, base_dir=ANTCC_WINDOW_FIXTURE_DIR, now=ANTCC_WINDOW_TODAY
+        )
+        _assert_totals_match(expected, actual, label="window: ")
+
+    def test_window_excludes_out_of_range_day_and_dedups_streaming(self):
+        with patch.object(watcher, "_utcnow", return_value=ANTCC_WINDOW_TODAY):
+            actual = _collector_model_totals(days_back=7, base_dir=ANTCC_WINDOW_FIXTURE_DIR)
+        # Hardcoded ground truth proves the 2026-05-09 record was excluded and
+        # the streaming 05-10 duplicate counted once (final usage only).
+        _assert_totals_match(ANTCC_WINDOW_EXPECTED, actual, label="window-truth: ")
 
 
 @skip_unless_ccusage
