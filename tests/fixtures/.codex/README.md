@@ -190,8 +190,10 @@ adds the new ones, so the final value for that id wins (not the sum). Author at
 least two lines with the same `message.id` and increasing usage, and assert the
 total reflects only the last one. (This is the bug the parser exists to fix:
 antcc leaves `requestId` absent or empty, so ccusage itself double-counts —
-https://github.com/ryoppippi/ccusage/issues/976.) Note antcc cost is hardcoded
-to `0` by the parser, so don't assert a non-zero cost here.
+https://github.com/ryoppippi/ccusage/issues/976.) AntCC cost comes from the
+shared pricing table when rates are available; unknown models still price as
+`0`. GLM text models are fetched from Z.ai's official pricing page, with
+bundled Z.ai rates only as a last-resort fallback when the page is unavailable.
 
 The committed fixture is a sanitized real streaming assistant response with the
 source metadata kept as-is. Three records share one `message.id` and omit

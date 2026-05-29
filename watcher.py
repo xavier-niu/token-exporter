@@ -67,7 +67,12 @@ def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> di
         return None
 
 
-def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> dict:
+def _scan_antcc_dir(
+    base_dir: str,
+    since: date,
+    timezone_name: str = "UTC",
+    pricing_rates: dict | None = None,
+) -> dict:
     """Scan AntCC JSONL files directly with msg_id dedup.
 
     AntCC records have empty requestId, so ccusage doesn't dedup them
@@ -84,7 +89,8 @@ def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> d
     # Aggregate per (project_key, date, model) with dedup by msg_id
     # {project_key: {date: {model: {"input": N, "output": N, ...}}}}
     agg: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
-    # Per-msg_id token values for dedup: {project_key: {date: {msg_id: {"input": N, ...}}}}
+    # Per-msg_id token values for dedup:
+    # {project_key: {date: {msg_id: {"input": N, ...}}}}
     msg_values: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
 
     for project_dir in Path(projects_dir).iterdir():
@@ -164,13 +170,23 @@ def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> d
         for date_str, models in sorted(dates.items()):
             breakdowns = []
             for model, tokens in sorted(models.items()):
+                cost = 0
+                if pricing_rates:
+                    cost = pricing.cost_for(
+                        pricing_rates,
+                        model,
+                        tokens["input"],
+                        tokens["cache_read"],
+                        tokens["output"],
+                        tokens["cache_creation"],
+                    )
                 breakdowns.append({
                     "modelName": model,
                     "inputTokens": tokens["input"],
                     "outputTokens": tokens["output"],
                     "cacheCreationTokens": tokens["cache_creation"],
                     "cacheReadTokens": tokens["cache_read"],
-                    "cost": 0,
+                    "cost": cost,
                 })
             entries.append({
                 "date": date_str,
@@ -178,8 +194,14 @@ def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> d
                 "outputTokens": sum(b["outputTokens"] for b in breakdowns),
                 "cacheCreationTokens": sum(b["cacheCreationTokens"] for b in breakdowns),
                 "cacheReadTokens": sum(b["cacheReadTokens"] for b in breakdowns),
-                "totalTokens": sum(b["inputTokens"] + b["outputTokens"] + b["cacheCreationTokens"] + b["cacheReadTokens"] for b in breakdowns),
-                "totalCost": 0,
+                "totalTokens": sum(
+                    b["inputTokens"]
+                    + b["outputTokens"]
+                    + b["cacheCreationTokens"]
+                    + b["cacheReadTokens"]
+                    for b in breakdowns
+                ),
+                "totalCost": sum(b["cost"] for b in breakdowns),
                 "modelsUsed": [b["modelName"] for b in breakdowns],
                 "modelBreakdowns": breakdowns,
             })
@@ -416,15 +438,25 @@ class CcusageCollector:
 
     Uses ccusage CLI for Claude Code (cc) directories and inline JSONL
     parsing with msg_id dedup for AntCC directories (ccusage doesn't
-    dedup when requestId is empty).
+    dedup when requestId is empty). AntCC costs are priced from the shared
+    pricing map because the collector cannot use ccusage's raw AntCC totals.
     """
 
-    def __init__(self, claude_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC"):
+    def __init__(
+        self,
+        claude_dirs: list[str],
+        days_back: int = 7,
+        on_record=None,
+        state_file: str = "",
+        timezone_name: str = "UTC",
+        pricing_rates: dict | None = None,
+    ):
         self.claude_dirs = claude_dirs
         self.days_back = days_back
         self.on_record = on_record
         self.state_file = state_file
         self.timezone_name = timezone_name
+        self.pricing_rates = pricing_rates or {}
         self._last_totals: dict[tuple, dict[str, float]] = {}
         if state_file:
             self._last_totals = _load_last_totals(state_file)
@@ -443,8 +475,10 @@ class CcusageCollector:
                 continue
             agent = _detect_agent(claude_dir)
             if agent == "antcc":
-                data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
-                total_records += _process_ccusage_data(data, agent, self.on_record, self._last_totals)
+                data = _scan_antcc_dir(claude_dir, since, self.timezone_name, self.pricing_rates)
+                total_records += _process_ccusage_data(
+                    data, agent, self.on_record, self._last_totals
+                )
             else:
                 data = _run_ccusage(claude_dir, since, self.timezone_name)
                 if data is None:
@@ -463,8 +497,7 @@ class CodexCollector:
     """Collects token usage from Codex data directories.
 
     Scans the session JSONL files directly (with cumulative-counter dedup) and
-    prices them via the shared LiteLLM-sourced pricing table, rather than
-    shelling out to a CLI.
+    prices them via the shared pricing table, rather than shelling out to a CLI.
     """
 
     def __init__(self, codex_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC", pricing_rates: dict | None = None):

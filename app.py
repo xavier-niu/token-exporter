@@ -143,6 +143,7 @@ def main():
             on_record=record_usage,
             state_file=cc_state,
             timezone_name=config["timezone"],
+            pricing_rates=pricing_rates,
         )
         logger.info("Scanning Claude Code / AntCC history...")
         cc_collector.scan_history()

@@ -49,11 +49,32 @@ docker run -d \
 | Env Var | Default | Description |
 |---|---|---|
 | `LISTEN_PORT` | `14531` | Prometheus metrics port |
-| `WATCH_INTERVAL` | `5` | Seconds between file checks |
-| `CLAUDE_CONFIG_DIR` | `~/.claude,~/.codefuse/engine/cc,~/.codefuse/engine/codex,~/.codex` | Comma-separated config directories (Claude Code/AntCC use `projects/` subdirs, Codex/CodeFuse Codex use `sessions/` subdirs) |
+| `WATCH_INTERVAL` | `60` | Seconds between file checks |
+| `CLAUDE_CONFIG_DIR` | `~/.claude,~/.codefuse/engine/cc` | Comma-separated Claude Code/AntCC config directories using `projects/` subdirs |
+| `CODEX_CONFIG_DIR` | `~/.codex,~/.codefuse/engine/codex` | Comma-separated Codex/CodeFuse Codex config directories using `sessions/` subdirs |
 | `DAYS_BACK` | `7` | Days of history to scan on startup |
 | `SOURCE` | `""` | Source label for multi-machine setups |
 | `STATE_FILE` | `~/.token-exporter/state.json` (`/etc/token-exporter/state.json` in Docker) | JSON state file for processed offsets, dedup keys, and Codex cumulative counters |
+| `PRICING_FILE` | `/opt/token-exporter/pricing.json` | Optional local pricing override, keyed by model |
+| `PRICING_CACHE` | `~/.token-exporter/pricing-cache.json` | Cached pricing map; official-source caches use sibling files such as `pricing-cache-zai.json` |
+| `PRICING_TTL_SECS` | `86400` | Seconds before refreshing the LiteLLM pricing cache |
+
+## Pricing
+
+Claude Code (`cc`) records are read through `ccusage claude daily`, so their
+costs come from ccusage's offline pricing snapshot. AntCC, Codex, and CodeFuse
+Codex are parsed directly by this exporter, so their costs come from the
+shared pricing map plus any `PRICING_FILE` overrides. The shared map is built
+from LiteLLM plus official provider sources where available. GLM text model
+prices are fetched from Z.ai's official pricing page and cached in a sibling
+cache file, with bundled Z.ai rates only as a last-resort fallback when the
+official page is unavailable.
+
+Model lookup tolerates providerless names and common case/punctuation
+differences, for example `glm5`, `GLM-5`, `glm-5.1`, `glm-5p1`, and
+provider-prefixed keys. For official model families, bare names prefer local
+or official provider entries such as `zai/` for GLM, `minimax/` for MiniMax,
+and `moonshot/` for Kimi, rather than third-party-hosted copies.
 
 ## Metrics
 

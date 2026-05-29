@@ -61,8 +61,8 @@ assistant records share the same real `message.id` and intentionally omit
 `requestId`, matching the source AntCC envelope. The first two records carry the
 initial usage and the final record carries the completed usage.
 `TestAntccFixture` asserts the parser's message-id dedup behavior by expecting
-only the last usage snapshot to count. AntCC cost is hardcoded to `0` by the
-parser.
+only the last usage snapshot to count, and that costs come from the shared
+pricing table when rates are available.
 
 ## `.claude/`
 

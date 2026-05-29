@@ -235,12 +235,13 @@ class TestCcusageCollector(unittest.TestCase):
 class TestAntccFixture(unittest.TestCase):
     """Parse the committed, sanitized real-world AntCC fixture end-to-end."""
 
-    def _collect(self):
+    def _collect(self, pricing_rates=None):
         records = []
         collector = CcusageCollector(
             claude_dirs=[str(ANTCC_FIXTURE_DIR)],
             days_back=UNBOUNDED_DAYS_BACK,
             on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates=pricing_rates,
         )
         collector.scan_history()
         return records
@@ -273,6 +274,21 @@ class TestAntccFixture(unittest.TestCase):
 
         assert len({row["message"]["id"] for row in usage_rows}) == 1
         assert all("requestId" not in row for row in usage_rows)
+
+    def test_applies_litellm_pricing_to_fixture(self):
+        rates = {
+            "claude-opus-4-6": {
+                "input": 1.0,
+                "cached": 0.1,
+                "output": 2.0,
+                "cache_creation": 0.5,
+            }
+        }
+        records = self._collect(pricing_rates=rates)
+        _, rec = records[0]
+        assert rec["cost_usd"] == pytest.approx(
+            (3 * 1.0 + 20851 * 0.1 + 355 * 2.0 + 4677 * 0.5) / 1e6
+        )
 
 
 class TestCodexCollector(unittest.TestCase):
