@@ -160,11 +160,105 @@ class TestCcusageCollector(unittest.TestCase):
         # Second scan with increased tokens
         updated = json.loads(json.dumps(SAMPLE_CCUSAGE_INSTANCES))
         updated["projects"]["-home-nxw-developer-token-exporter"][0]["inputTokens"] = 1500
+        updated["projects"]["-home-nxw-developer-token-exporter"][0]["totalCost"] = 0.015
         updated["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["inputTokens"] = 1500
+        updated["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["cost"] = 0.015
         mock_run.return_value = updated
         collector.scan_history()
         assert len(records) == 3
         assert records[2][1]["input_tokens"] == 500  # 1500 - 1000 delta
+        assert records[2][1]["cost_usd"] == pytest.approx(0.005)
+
+    @patch("watcher.os.path.isdir", return_value=True)
+    @patch("watcher._scan_antcc_dir")
+    def test_antcc_incremental_rescan_emits_only_delta_cost(self, mock_scan, mock_isdir):
+        first = {
+            "projects": {
+                "-home-nxw-developer-token-exporter": [
+                    {
+                        "date": _DAY1_STR,
+                        "modelBreakdowns": [
+                            {
+                                "modelName": "GLM-5.2",
+                                "inputTokens": 100,
+                                "outputTokens": 0,
+                                "cacheCreationTokens": 0,
+                                "cacheReadTokens": 0,
+                                "cost": 0.001,
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        second = json.loads(json.dumps(first))
+        second["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["inputTokens"] = 150
+        second["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["cost"] = 0.0015
+        mock_scan.side_effect = [first, second]
+
+        records = []
+        collector = CcusageCollector(
+            claude_dirs=["/fake/cc"],
+            days_back=7,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates={"zai/glm-5.2": {"input": 10, "cached": 0, "output": 0, "cache_creation": 0}},
+        )
+
+        collector.scan_history()
+        collector.scan_history()
+
+        assert [rec["input_tokens"] for _, rec in records] == [100, 50]
+        assert records[0][1]["cost_usd"] == pytest.approx(0.001)
+        assert records[1][1]["cost_usd"] == pytest.approx(0.0005)
+
+    @patch("watcher.os.path.isdir", return_value=True)
+    @patch("watcher._run_ccusage")
+    def test_collector_state_persists_cost_totals(self, mock_run, mock_isdir):
+        mock_run.return_value = SAMPLE_CCUSAGE_INSTANCES
+        with tempfile.TemporaryDirectory() as d:
+            state_file = Path(d) / "collector.json"
+            collector = CcusageCollector(
+                claude_dirs=["/fake/dir"],
+                days_back=7,
+                on_record=lambda agent, rec: None,
+                state_file=str(state_file),
+            )
+
+            collector.scan_history()
+
+            state = json.loads(state_file.read_text())
+        rows = state["last_totals"]
+        key = f"unknown\x00token-exporter\x00GLM-5.1\x00{_DAY1_STR}"
+        assert rows[key]["cost_usd"] == pytest.approx(0.01)
+
+    @patch("watcher.os.path.isdir", return_value=True)
+    @patch("watcher._run_ccusage")
+    def test_legacy_state_without_cost_does_not_emit_full_day_cost(self, mock_run, mock_isdir):
+        updated = json.loads(json.dumps(SAMPLE_CCUSAGE_INSTANCES))
+        updated["projects"]["-home-nxw-developer-token-exporter"][0]["inputTokens"] = 1500
+        updated["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["inputTokens"] = 1500
+        updated["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["cost"] = 0.015
+        mock_run.return_value = updated
+
+        records = []
+        collector = CcusageCollector(
+            claude_dirs=["/fake/dir"],
+            days_back=7,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+        )
+        collector._last_totals = {
+            ("unknown", "token-exporter", "GLM-5.1", _DAY1_STR): {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_creation_tokens": 50,
+                "cache_read_tokens": 500,
+            }
+        }
+
+        collector.scan_history()
+
+        assert records[0][1]["input_tokens"] == 500
+        assert records[0][1]["cost_usd"] == 0
 
     @patch("watcher.os.path.isdir", return_value=True)
     @patch("watcher._run_ccusage")

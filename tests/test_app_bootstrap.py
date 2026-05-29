@@ -40,20 +40,24 @@ class TestBootstrap(unittest.TestCase):
                 ("cc", "p1", "claude", "2026-05-09"): {
                     "input_tokens": 100, "output_tokens": 50,
                     "cache_creation_tokens": 10, "cache_read_tokens": 5,
+                    "cost_usd": 0.11,
                 },
                 ("cc", "p1", "claude", "2026-05-10"): {
                     "input_tokens": 200, "output_tokens": 80,
                     "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                    "cost_usd": 0.22,
                 },
                 ("antcc", "p2", "claude", "2026-05-10"): {
                     "input_tokens": 50, "output_tokens": 25,
                     "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                    "cost_usd": 0.05,
                 },
             })
             _write_last_totals(codex, {
                 ("codex", "p1", "gpt-5", "2026-05-10"): {
                     "input_tokens": 1000, "output_tokens": 200,
                     "cache_creation_tokens": 0, "cache_read_tokens": 0,
+                    "cost_usd": 0.5,
                 },
             })
 
@@ -64,14 +68,16 @@ class TestBootstrap(unittest.TestCase):
         self.assertEqual(cum[("devant", "cc", "p1", "claude")]["input"], 300)
         self.assertEqual(cum[("devant", "cc", "p1", "claude")]["output"], 130)
         self.assertEqual(cum[("devant", "cc", "p1", "claude")]["cache_creation"], 10)
+        self.assertAlmostEqual(cum[("devant", "cc", "p1", "claude")]["cost"], 0.33)
         self.assertEqual(cum[("devant", "antcc", "p2", "claude")]["input"], 50)
+        self.assertEqual(cum[("devant", "antcc", "p2", "claude")]["cost"], 0.05)
         self.assertEqual(cum[("devant", "codex", "p1", "gpt-5")]["input"], 1000)
-        # cost is not in last_totals, so bootstrap leaves it at 0.
-        self.assertEqual(cum[("devant", "cc", "p1", "claude")]["cost"], 0)
+        self.assertEqual(cum[("devant", "codex", "p1", "gpt-5")]["cost"], 0.5)
 
         daily = {tuple(e["key"]): e["values"] for e in result["daily"]}
         # Daily keeps per-date granularity.
         self.assertEqual(daily[("devant", "cc", "p1", "claude", "2026-05-09")]["input"], 100)
+        self.assertEqual(daily[("devant", "cc", "p1", "claude", "2026-05-09")]["cost"], 0.11)
         self.assertEqual(daily[("devant", "cc", "p1", "claude", "2026-05-10")]["input"], 200)
 
     def test_corrupt_file_does_not_break_others(self):
@@ -105,6 +111,61 @@ class TestBootstrap(unittest.TestCase):
         cum = {tuple(e["key"]): e["values"] for e in result["cumulative"]}
         self.assertEqual(len(cum), 1)
         self.assertEqual(cum[("devant", "agent", "project", "model")]["input"], 5)
+
+    def test_merge_state_with_bootstrap_recovers_lagging_counter_snapshot(self):
+        state = {
+            "schema_version": 1,
+            "cumulative": [
+                {
+                    "key": ["devant", "antcc", "p", "GLM-5.1"],
+                    "values": {"input": 100, "output": 10, "cost": 0.1},
+                },
+                {
+                    "key": ["devant", "cc", "old", "claude"],
+                    "values": {"input": 900, "output": 90, "cost": 9},
+                },
+            ],
+            "daily": [
+                {
+                    "key": ["devant", "antcc", "p", "GLM-5.1", "2026-05-10"],
+                    "values": {"input": 100, "output": 10, "cost": 0.1},
+                },
+            ],
+        }
+        bootstrap = {
+            "schema_version": 1,
+            "cumulative": [
+                {
+                    "key": ["devant", "antcc", "p", "GLM-5.1"],
+                    "values": {"input": 150, "output": 15, "cost": 0.15},
+                },
+                {
+                    "key": ["devant", "cc", "old", "claude"],
+                    "values": {"input": 800, "output": 80, "cost": 8},
+                },
+            ],
+            "daily": [
+                {
+                    "key": ["devant", "antcc", "p", "GLM-5.1", "2026-05-10"],
+                    "values": {"input": 150, "output": 15, "cost": 0.15},
+                },
+            ],
+        }
+
+        merged = app._merge_state_with_bootstrap(state, bootstrap)
+
+        cum = {tuple(e["key"]): e["values"] for e in merged["cumulative"]}
+        self.assertEqual(cum[("devant", "antcc", "p", "GLM-5.1")]["input"], 150)
+        self.assertEqual(cum[("devant", "antcc", "p", "GLM-5.1")]["cost"], 0.15)
+        # Existing counter state can include older history outside last_totals;
+        # it must not be reduced by a smaller bootstrap row.
+        self.assertEqual(cum[("devant", "cc", "old", "claude")]["input"], 900)
+
+        daily = {tuple(e["key"]): e["values"] for e in merged["daily"]}
+        self.assertEqual(
+            daily[("devant", "antcc", "p", "GLM-5.1", "2026-05-10")]["input"],
+            150,
+        )
 
 
 if __name__ == "__main__":

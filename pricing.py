@@ -295,7 +295,7 @@ def lookup(rates: dict, model: str) -> dict:
             if "/" not in key:
                 return spec
         for key, spec in matches:
-            if key.startswith(official_prefixes):
+            if key.lower().startswith(official_prefixes):
                 return spec
         for normalized in model_normalized:
             spec = _OFFICIAL_MODEL_RATES_NORMALIZED.get(normalized)

@@ -72,6 +72,13 @@ class TestLookup:
         }
         assert pricing.lookup(rates, "GLM5.2") == {"input": 1.0}
 
+    def test_future_glm_version_prefers_cased_official_provider(self):
+        rates = {
+            "baseten/zai-org/GLM-5.2": {"input": 0.9},
+            "ZAI/GLM-5.2": {"input": 1.0},
+        }
+        assert pricing.lookup(rates, "GLM5.2") == {"input": 1.0}
+
     def test_glm_family_prefers_official_provider(self):
         rates = {
             "baseten/zai-org/GLM-5": {"input": 0.95},
@@ -107,6 +114,13 @@ class TestLookup:
         rates = {
             "groq/moonshotai/kimi-k2-instruct-0905": {"input": 1.0},
             "moonshot/kimi-k2-0905-preview": {"input": 0.6},
+        }
+        assert pricing.lookup(rates, "Kimi K2 Instruct 0905") == {"input": 0.6}
+
+    def test_kimi_instruct_uses_cased_official_provider(self):
+        rates = {
+            "groq/moonshotai/kimi-k2-instruct-0905": {"input": 1.0},
+            "Moonshot/Kimi-K2-0905-Preview": {"input": 0.6},
         }
         assert pricing.lookup(rates, "Kimi K2 Instruct 0905") == {"input": 0.6}
 

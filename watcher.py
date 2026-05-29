@@ -212,6 +212,7 @@ def _scan_antcc_dir(
 
 # Token fields to track for delta computation
 _TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cache_read_tokens")
+_STATE_FIELDS = (*_TOKEN_FIELDS, "cost_usd")
 
 
 def _project_from_cwd(cwd: str) -> str:
@@ -345,7 +346,7 @@ def _load_last_totals(path: str) -> dict[tuple, dict]:
     totals = {}
     for key_str, values in data.get("last_totals", {}).items():
         key = tuple(key_str.split("\x00"))
-        totals[key] = {k: v for k, v in values.items() if k in _TOKEN_FIELDS}
+        totals[key] = {k: v for k, v in values.items() if k in _STATE_FIELDS}
     return totals
 
 
@@ -374,7 +375,14 @@ def _prune_stale_totals(totals: dict[tuple, dict], cutoff: date) -> None:
         del totals[k]
 
 
-def _process_ccusage_data(data: dict, agent: str, on_record, last_totals: dict, project: str = "") -> int:
+def _process_ccusage_data(
+    data: dict,
+    agent: str,
+    on_record,
+    last_totals: dict,
+    project: str = "",
+    pricing_rates: dict | None = None,
+) -> int:
     """Parse ccusage JSON output and emit delta records.
 
     Handles two formats:
@@ -401,11 +409,12 @@ def _process_ccusage_data(data: dict, agent: str, on_record, last_totals: dict, 
                     "output_tokens": bd.get("outputTokens", 0),
                     "cache_creation_tokens": bd.get("cacheCreationTokens", 0),
                     "cache_read_tokens": bd.get("cacheReadTokens", 0),
+                    "cost_usd": bd.get("cost", 0) or 0,
                 }
                 key = (agent, project, model, date_str)
                 last = last_totals.get(key)
                 if last is None:
-                    delta = current
+                    delta = {field: current[field] for field in _TOKEN_FIELDS}
                 else:
                     delta = {
                         field: max(current[field] - last.get(field, 0), 0)
@@ -417,6 +426,22 @@ def _process_ccusage_data(data: dict, agent: str, on_record, last_totals: dict, 
                 if not has_delta:
                     continue
 
+                if pricing_rates:
+                    cost_delta = pricing.cost_for(
+                        pricing_rates,
+                        model,
+                        delta["input_tokens"],
+                        delta["cache_read_tokens"],
+                        delta["output_tokens"],
+                        delta["cache_creation_tokens"],
+                    )
+                elif last is None:
+                    cost_delta = current["cost_usd"]
+                elif "cost_usd" not in last:
+                    cost_delta = 0
+                else:
+                    cost_delta = max(current["cost_usd"] - last.get("cost_usd", 0), 0)
+
                 record = {
                     "timestamp": datetime.fromisoformat(date_str) if date_str else None,
                     "model": model,
@@ -425,7 +450,7 @@ def _process_ccusage_data(data: dict, agent: str, on_record, last_totals: dict, 
                     "output_tokens": delta["output_tokens"],
                     "cache_creation_tokens": delta["cache_creation_tokens"],
                     "cache_read_tokens": delta["cache_read_tokens"],
-                    "cost_usd": bd.get("cost", 0) or 0,
+                    "cost_usd": cost_delta,
                 }
                 if on_record:
                     on_record(agent, record)
@@ -477,7 +502,11 @@ class CcusageCollector:
             if agent == "antcc":
                 data = _scan_antcc_dir(claude_dir, since, self.timezone_name, self.pricing_rates)
                 total_records += _process_ccusage_data(
-                    data, agent, self.on_record, self._last_totals
+                    data,
+                    agent,
+                    self.on_record,
+                    self._last_totals,
+                    pricing_rates=self.pricing_rates,
                 )
             else:
                 data = _run_ccusage(claude_dir, since, self.timezone_name)
@@ -525,7 +554,13 @@ class CodexCollector:
                 continue
             agent = _detect_agent(codex_dir)
             data = _scan_antcodex_dir(codex_dir, since, self.timezone_name, self.pricing_rates)
-            total_records += _process_ccusage_data(data, agent, self.on_record, self._last_totals)
+            total_records += _process_ccusage_data(
+                data,
+                agent,
+                self.on_record,
+                self._last_totals,
+                pricing_rates=self.pricing_rates,
+            )
         if self.state_file:
             _save_last_totals(self.state_file, self._last_totals)
         logger.info("CodexCollector: emitted %d records", total_records)

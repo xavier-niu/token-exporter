@@ -67,8 +67,8 @@ def _bootstrap_from_last_totals(last_totals_files: list[str], source: str) -> di
 
     Used on first deploy of the persisted-counter fix when no counter snapshot
     file exists yet. Without this, the first restart after the upgrade still
-    shows zero historic tokens; with it, we recover everything except `cost`
-    (last_totals does not record cost).
+    shows zero historic tokens/cost; with it, we recover from the collector
+    last_totals snapshot.
     """
     cumulative: dict[tuple, dict[str, float]] = {}
     daily: dict[tuple, dict[str, float]] = {}
@@ -77,6 +77,7 @@ def _bootstrap_from_last_totals(last_totals_files: list[str], source: str) -> di
         "output": "output_tokens",
         "cache_creation": "cache_creation_tokens",
         "cache_read": "cache_read_tokens",
+        "cost": "cost_usd",
     }
     for path in last_totals_files:
         try:
@@ -90,9 +91,9 @@ def _bootstrap_from_last_totals(last_totals_files: list[str], source: str) -> di
                 continue
             agent, project, model, date_str = parts
             cum_key = (source, agent, project, model)
-            cum = cumulative.setdefault(cum_key, {f: 0.0 for f in (*field_map, "cost")})
+            cum = cumulative.setdefault(cum_key, {f: 0.0 for f in field_map})
             d_key = (source, agent, project, model, date_str)
-            d = daily.setdefault(d_key, {f: 0.0 for f in (*field_map, "cost")})
+            d = daily.setdefault(d_key, {f: 0.0 for f in field_map})
             for short, long in field_map.items():
                 v = float(values.get(long, 0) or 0)
                 cum[short] += v
@@ -102,6 +103,40 @@ def _bootstrap_from_last_totals(last_totals_files: list[str], source: str) -> di
         "cumulative": [{"key": list(k), "values": v} for k, v in cumulative.items()],
         "daily": [{"key": list(k), "values": v} for k, v in daily.items()],
     }
+
+
+def _merge_state_with_bootstrap(state: dict, bootstrap: dict) -> dict:
+    """Keep restored counters at least as high as collector last_totals.
+
+    Collector offsets are written before the metrics counter snapshot. If the
+    process dies between those writes, the next startup can recover by taking
+    the max of the saved counter snapshot and the collector totals.
+    """
+    merged = {"schema_version": 1, "cumulative": [], "daily": []}
+    for section in ("cumulative", "daily"):
+        rows: dict[tuple, dict[str, float]] = {}
+        for entry in state.get(section, []):
+            key = tuple(entry.get("key", []))
+            if not key:
+                continue
+            rows[key] = {
+                field: float(value or 0)
+                for field, value in entry.get("values", {}).items()
+            }
+
+        for entry in bootstrap.get(section, []):
+            key = tuple(entry.get("key", []))
+            if not key:
+                continue
+            row = rows.setdefault(key, {})
+            for field, value in entry.get("values", {}).items():
+                row[field] = max(float(row.get(field, 0) or 0), float(value or 0))
+
+        merged[section] = [
+            {"key": list(key), "values": values}
+            for key, values in rows.items()
+        ]
+    return merged
 
 
 def main():
@@ -115,14 +150,14 @@ def main():
     counter_state_file = config["state_file"].replace(".json", "-counters.json") if config["state_file"] else ""
 
     if counter_state_file:
+        last_totals_files = [p for p in (cc_state, codex_state) if p]
         state = load_state(counter_state_file)
+        bootstrap = _bootstrap_from_last_totals(last_totals_files, config["source"])
         if state:
+            state = _merge_state_with_bootstrap(state, bootstrap)
             restore_state(state)
             logger.info("Restored counter state from %s", counter_state_file)
         else:
-            bootstrap = _bootstrap_from_last_totals(
-                [p for p in (cc_state, codex_state) if p], config["source"]
-            )
             if bootstrap["cumulative"] or bootstrap["daily"]:
                 restore_state(bootstrap)
                 logger.info("Bootstrapped counter state from last_totals files")
