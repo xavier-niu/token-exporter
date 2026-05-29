@@ -77,17 +77,16 @@ def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> di
         return None
 
 
-def _scan_antcc_dir(
-    base_dir: str,
-    since: date,
-    timezone_name: str = "UTC",
-    pricing_rates: dict | None = None,
-) -> dict:
+def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> dict:
     """Scan AntCC JSONL files directly with msg_id dedup.
 
     AntCC records have empty requestId, so ccusage doesn't dedup them
     (https://github.com/ryoppippi/ccusage/issues/976). This parser
     deduplicates by msg_id to produce correct counts.
+
+    Cost is left at 0 here; it is priced from the shared pricing table by
+    _process_ccusage_data (on the per-poll token delta), so computing it on the
+    cumulative totals here would just be thrown away.
 
     Returns dict in ccusage --instances format:
     {"projects": {"-home-...": [{"date": "...", "modelBreakdowns": [...]}]}}
@@ -180,23 +179,13 @@ def _scan_antcc_dir(
         for date_str, models in sorted(dates.items()):
             breakdowns = []
             for model, tokens in sorted(models.items()):
-                cost = 0
-                if pricing_rates:
-                    cost = pricing.cost_for(
-                        pricing_rates,
-                        model,
-                        tokens["input"],
-                        tokens["cache_read"],
-                        tokens["output"],
-                        tokens["cache_creation"],
-                    )
                 breakdowns.append({
                     "modelName": model,
                     "inputTokens": tokens["input"],
                     "outputTokens": tokens["output"],
                     "cacheCreationTokens": tokens["cache_creation"],
                     "cacheReadTokens": tokens["cache_read"],
-                    "cost": cost,
+                    "cost": 0,
                 })
             entries.append({
                 "date": date_str,
@@ -211,7 +200,9 @@ def _scan_antcc_dir(
                     + b["cacheReadTokens"]
                     for b in breakdowns
                 ),
-                "totalCost": sum(b["cost"] for b in breakdowns),
+                # No cost here: antcc is priced from the token delta in
+                # _process_ccusage_data, so a cumulative cost would be discarded.
+                "totalCost": 0,
                 "modelsUsed": [b["modelName"] for b in breakdowns],
                 "modelBreakdowns": breakdowns,
             })
@@ -510,7 +501,7 @@ class CcusageCollector:
                 continue
             agent = _detect_agent(claude_dir)
             if agent == "antcc":
-                data = _scan_antcc_dir(claude_dir, since, self.timezone_name, self.pricing_rates)
+                data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
                 total_records += _process_ccusage_data(
                     data,
                     agent,
