@@ -33,6 +33,37 @@ The fixture dates are fixed, so the test scans with a very large `days_back`
 intentional: it isolates *parsing/dedup* correctness from the date-window
 filtering, and keeps the test from rotting as the calendar advances.
 
+## `.codefuse/engine/codex/`
+
+A sanitized, **partial** slice of a real AntCodex
+`~/.codefuse/engine/codex` directory. It uses the same
+`sessions/YYYY/MM/DD/rollout-*.jsonl` layout and parser as `.codex/`, but the
+fixture path makes `_detect_agent` label the records as `antcodex`.
+
+The fixture keeps the real JSONL envelope and metadata, including paths, ids,
+versions, git metadata, empty `token_count` records, and repeated cumulative
+snapshots from the source session. Conversation-bearing fields are redacted
+(`content`, user/agent `message`, reasoning summaries, tool arguments/output,
+and similar text payloads), so `TestAntcodexFixture` checks realistic input
+without shipping private conversation text.
+
+## `.codefuse/engine/cc/`
+
+A sanitized, **partial** slice of a real AntCC `~/.codefuse/engine/cc`
+directory. The layout mirrors production:
+`projects/<project-key>/**/*.jsonl`.
+
+The fixture keeps the real JSONL envelope and metadata, including paths, ids,
+versions, timestamps, model names, and token usage from a streaming assistant
+response. Conversation-bearing fields are redacted (`message.content`, file
+snapshots, tool results, last prompt text, and similar payloads). The three
+assistant records share the same real `message.id` and intentionally omit
+`requestId`, matching the source AntCC envelope. The first two records carry the
+initial usage and the final record carries the completed usage.
+`TestAntccFixture` asserts the parser's message-id dedup behavior by expecting
+only the last usage snapshot to count. AntCC cost is hardcoded to `0` by the
+parser.
+
 ## `.claude/`
 
 A sanitized, **partial** Claude Code history: `projects/<key>/*.jsonl` with
@@ -51,11 +82,3 @@ opus-4-8 regressing to $0 cost. It is **gated on the ccusage binary** and skips
 where ccusage isn't installed. The fixture includes a duplicate `message.id` +
 `requestId` line to exercise ccusage's dedup, and uses fixed dates scanned with
 an unbounded `days_back` (same rationale as `.codex/`).
-
-## Not included
-
-- **antcc** (`~/.codefuse/engine/cc`) and **antcodex**
-  (`~/.codefuse/engine/codex`): not installed on the machine these fixtures
-  were captured from, so there is no real data to sanitize. Not fabricated.
-  (antcodex shares `_scan_antcodex_dir` with codex, so that parser path is
-  already exercised by `.codex/`.)

@@ -14,8 +14,8 @@ conversations. This file is the recipe for (re)building it from a real machine.
 ## 1. What the parser actually consumes
 
 `_scan_antcodex_dir` walks `sessions/**/*.jsonl` and reads **only** these,
-line by line (one JSON object per line). Everything else is conversation
-content you should drop:
+line by line (one JSON object per line). Other metadata can stay in fixtures;
+conversation-bearing fields should be redacted.
 
 | Event (`type` / `payload.type`)        | Fields used                                                                                  | Purpose                          |
 | -------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------- |
@@ -24,10 +24,11 @@ content you should drop:
 | `event_msg` with `payload.type == "token_count"` | `payload.info.total_token_usage.{input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens}` | the usage numbers |
 | *(any line)*                           | top-level `timestamp`                                                                        | date bucket (in the run timezone)|
 
-Drop entirely: `response_item`, `event_msg` of type `user_message` /
-`agent_message` / `web_search_*` / `task_*`, and all of `session_meta`'s other
-payload keys (`git`, `base_instructions`, `id`, …). Keep one or two redacted
-non-token events if you want the fixture to also prove the parser ignores them.
+Redact conversation-bearing fields such as `content`, user/agent `message`,
+reasoning summaries, tool arguments/output, file snapshots, and last prompt
+text. Keep metadata such as ids, cwd, versions, timestamps, git metadata, and
+rate-limit envelopes as-is unless a specific field itself contains private
+conversation content.
 
 ## 2. Key behaviors to preserve
 
@@ -55,45 +56,66 @@ The directory date is cosmetic — the parser dates events from each line's
 
 ## 4. Sanitization recipe (from a real session)
 
-Run against a real `~/.codex` session to emit a stripped copy, then hand-edit
-`cwd`/ids to placeholders and (optionally) round the token numbers so expected
-aggregates are trivial to compute:
+Run against a real `~/.codex` session to emit a redacted copy. Preserve the JSON
+objects as-is except for fields that carry conversation text or user file/tool
+payloads:
 
 ```python
 import json, sys
 
-KEEP_EVENT = {"token_count"}          # event_msg payload types to keep
-KEEP_TYPES = {"session_meta", "turn_context", "event_msg"}
+REDACTED = "<redacted: conversation content removed from fixture>"
+REDACTED_OBJ = {"redacted": "conversation content removed from fixture"}
 
-def strip(src, dst):
-    out = []
-    for line in open(src):
-        try:
-            o = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        t = o.get("type")
-        if t not in KEEP_TYPES:
-            continue
-        p = o.get("payload") or {}
-        if t == "session_meta":
-            o["payload"] = {"id": "demo-XXXX", "cwd": "/home/user/work/PLACEHOLDER"}
-        elif t == "turn_context":
-            o["payload"] = {"cwd": "/home/user/work/PLACEHOLDER", "model": p.get("model", "gpt-5")}
-        elif t == "event_msg":
-            if p.get("type") not in KEEP_EVENT:
-                continue
-            # keep only the usage block the parser reads
-            usage = (p.get("info") or {}).get("total_token_usage", {})
-            o["payload"] = {"type": "token_count", "info": {"total_token_usage": usage}}
-        out.append(json.dumps(o))
-    open(dst, "w").write("\n".join(out) + "\n")
+CONTENT_KEYS = {
+    "arguments",
+    "base_instructions",
+    "content",
+    "encrypted_content",
+    "images",
+    "lastPrompt",
+    "last_agent_message",
+    "local_images",
+    "output",
+    "snapshot",
+    "summary",
+    "text",
+    "text_elements",
+    "toolUseResult",
+}
 
-strip(sys.argv[1], sys.argv[2])
+def redacted_like(value):
+    if isinstance(value, list):
+        return [REDACTED]
+    if isinstance(value, dict):
+        return REDACTED_OBJ
+    if value is None:
+        return None
+    return REDACTED
+
+def sanitize(value):
+    if isinstance(value, list):
+        return [sanitize(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    out = {}
+    for key, item in value.items():
+        if key in CONTENT_KEYS:
+            out[key] = redacted_like(item)
+        elif key == "message" and not isinstance(item, dict):
+            out[key] = redacted_like(item)
+        else:
+            out[key] = sanitize(item)
+    return out
+
+with open(sys.argv[2], "w") as dst:
+    for line in open(sys.argv[1]):
+        if line.strip():
+            dst.write(json.dumps(sanitize(json.loads(line))) + "\n")
 ```
 
-Then: replace `PLACEHOLDER` with a fake project name, scrub any remaining real
-paths/ids, and sanity-check that no private text survived.
+Then: sanity-check that no private conversation text survived. Keep other fields
+as-is so the fixture continues to look like production data.
 
 ## 5. Compute expected aggregates by hand
 
@@ -120,11 +142,11 @@ the calendar moves — do **not** "fix" it by switching to recent dates.
 
 ## 7. Other agents
 
-Claude Code is committed (see below). antcc/antcodex are absent on the machine
-these fixtures were captured from, so they are **not committed** — build them the
-same way, **only from real data**, on an env that has them. Don't fabricate.
+Claude Code, AntCodex, and AntCC fixtures are committed alongside `.codex`.
+Build or refresh Ant fixtures the same way: **only from real data**, on an env
+that has them. Don't fabricate.
 
-### antcodex (`~/.codefuse/engine/codex`)
+### antcodex (`~/.codefuse/engine/codex`) — committed at `../.codefuse/engine/codex/`
 
 Shares `_scan_antcodex_dir` with codex, so sections 1–6 above apply verbatim.
 The only difference is the agent label: `_detect_agent` returns `antcodex` when
@@ -132,7 +154,11 @@ the path contains `/codex` but does **not** end in `/.codex`. So put the fixture
 under a dir like `.codefuse/engine/codex/sessions/...` and point the collector
 at `.codefuse/engine/codex`.
 
-### antcc (`~/.codefuse/engine/cc`)
+The committed fixture is a sanitized real session with the source metadata kept
+as-is, empty token-count events, duplicate cumulative snapshots, and redacted
+conversation payloads. Its expected totals live in `TestAntcodexFixture`.
+
+### antcc (`~/.codefuse/engine/cc`) — committed at `../.codefuse/engine/cc/`
 
 Different format and parser (`_scan_antcc_dir`) — it's the Claude-Code-style
 conversation JSONL, deduped by message id. Layout:
@@ -163,9 +189,13 @@ updates to the *same* message — the parser subtracts the previous values and
 adds the new ones, so the final value for that id wins (not the sum). Author at
 least two lines with the same `message.id` and increasing usage, and assert the
 total reflects only the last one. (This is the bug the parser exists to fix:
-antcc leaves `requestId` empty, so ccusage itself double-counts —
+antcc leaves `requestId` absent or empty, so ccusage itself double-counts —
 https://github.com/ryoppippi/ccusage/issues/976.) Note antcc cost is hardcoded
 to `0` by the parser, so don't assert a non-zero cost here.
+
+The committed fixture is a sanitized real streaming assistant response with the
+source metadata kept as-is. Three records share one `message.id` and omit
+`requestId`. Its expected totals live in `TestAntccFixture`.
 
 ### Claude Code (`~/.claude`)  — committed at `../.claude/`
 

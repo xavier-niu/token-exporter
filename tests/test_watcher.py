@@ -9,9 +9,12 @@ import pytest
 
 from watcher import CcusageCollector, CodexCollector, _extract_project
 
-# Committed, sanitized sample of a real ~/.codex directory (see fixtures/README.md).
+# Committed, sanitized samples of real agent data directories (see fixtures/README.md).
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 CODEX_FIXTURE_DIR = FIXTURES_DIR / ".codex"
+CODEFUSE_FIXTURE_DIR = FIXTURES_DIR / ".codefuse" / "engine"
+ANTCC_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "cc"
+ANTCODEX_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "codex"
 # Fixtures carry fixed dates; scan with an effectively unbounded window so the
 # test exercises parsing/dedup, not date-window filtering, and never ages out.
 UNBOUNDED_DAYS_BACK = 100_000
@@ -229,6 +232,49 @@ class TestCcusageCollector(unittest.TestCase):
         assert len(records) == 0
 
 
+class TestAntccFixture(unittest.TestCase):
+    """Parse the committed, sanitized real-world AntCC fixture end-to-end."""
+
+    def _collect(self):
+        records = []
+        collector = CcusageCollector(
+            claude_dirs=[str(ANTCC_FIXTURE_DIR)],
+            days_back=UNBOUNDED_DAYS_BACK,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+        )
+        collector.scan_history()
+        return records
+
+    def test_streaming_message_updates_are_deduped(self):
+        records = self._collect()
+
+        assert len(records) == 1
+        agent, rec = records[0]
+        assert agent == "antcc"
+        assert rec["project"] == "transfer"
+        assert rec["model"] == "claude-opus-4-6"
+        # Three real streaming updates share one message id; only the last wins.
+        assert rec["input_tokens"] == 3
+        assert rec["output_tokens"] == 355
+        assert rec["cache_creation_tokens"] == 4677
+        assert rec["cache_read_tokens"] == 20851
+        assert rec["cost_usd"] == 0
+        assert rec["timestamp"].date().isoformat() == "2026-04-14"
+
+    def test_fixture_preserves_missing_request_id(self):
+        fixture_file = (
+            ANTCC_FIXTURE_DIR
+            / "projects"
+            / "-home-nxw-developer-transfer"
+            / "4ddb168d-9741-4794-9318-72edd668ad79.jsonl"
+        )
+        rows = [json.loads(line) for line in fixture_file.read_text().splitlines()]
+        usage_rows = [row for row in rows if (row.get("message") or {}).get("usage")]
+
+        assert len({row["message"]["id"] for row in usage_rows}) == 1
+        assert all("requestId" not in row for row in usage_rows)
+
+
 class TestCodexCollector(unittest.TestCase):
     def test_antcodex_parser_emits_project_records_and_skips_duplicate_token_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,6 +439,43 @@ class TestCodexFixture(unittest.TestCase):
         assert cost["demo-api"] == pytest.approx((1600 * 3.0 + 200 * 0.3 + 250 * 15.0) / 1e6)
         # demo-web: (2200*1.25 + 600*0.125 + 420*10.0) / 1e6
         assert cost["demo-web"] == pytest.approx((2200 * 1.25 + 600 * 0.125 + 420 * 10.0) / 1e6)
+
+
+class TestAntcodexFixture(unittest.TestCase):
+    """Parse the committed, sanitized real-world AntCodex fixture end-to-end."""
+
+    def _collect(self, pricing_rates=None):
+        records = []
+        collector = CodexCollector(
+            codex_dirs=[str(ANTCODEX_FIXTURE_DIR)],
+            days_back=UNBOUNDED_DAYS_BACK,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates=pricing_rates,
+        )
+        collector.scan_history()
+        return records
+
+    def test_aggregates_real_codefuse_codex_session(self):
+        records = self._collect()
+
+        assert len(records) == 1
+        agent, rec = records[0]
+        assert agent == "antcodex"
+        assert rec["project"] == "ip-monitor"
+        assert rec["model"] == "gpt-5.5"
+        # Empty token_count records and repeated cumulative snapshots are ignored.
+        assert rec["input_tokens"] == 2963
+        assert rec["cache_read_tokens"] == 13824
+        assert rec["output_tokens"] == 367
+        assert rec["cache_creation_tokens"] == 0
+        assert rec["cost_usd"] == 0
+        assert rec["timestamp"].date().isoformat() == "2026-05-14"
+
+    def test_applies_pricing_to_fixture(self):
+        rates = {"gpt-5.5": {"input": 3.0, "cached": 0.3, "output": 15.0, "cache_creation": 3.0}}
+        records = self._collect(pricing_rates=rates)
+        _, rec = records[0]
+        assert rec["cost_usd"] == pytest.approx((2963 * 3.0 + 13824 * 0.3 + 367 * 15.0) / 1e6)
 
 
 if __name__ == "__main__":

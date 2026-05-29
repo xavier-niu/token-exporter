@@ -159,9 +159,6 @@ ZERO_TOTALS = {"input_tokens": 0, "output_tokens": 0, "cache_creation_tokens": 0
 def _assert_totals_match(expected: dict, actual: dict, label: str = ""):
     """Assert that expected and actual totals match for all models."""
     all_models = set(expected.keys()) | set(actual.keys())
-    if not all_models:
-        pytest.skip("No usage data found")
-
     for model in sorted(all_models):
         exp = expected.get(model, ZERO_TOTALS)
         act = actual.get(model, ZERO_TOTALS)
@@ -179,9 +176,6 @@ class TestAntccCrosscheck:
         """Last 7 days totals should match manual deduped scan."""
         expected = _manual_deduped_totals(days_back=7)
         actual = _collector_model_totals(days_back=7)
-
-        if not expected:
-            pytest.skip("No antcc data for last 7 days")
 
         _assert_totals_match(expected, actual, label="7-day: ")
 
