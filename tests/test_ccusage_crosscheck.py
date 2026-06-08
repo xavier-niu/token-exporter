@@ -246,12 +246,13 @@ class TestClaudeFixtureGroundTruth:
     delta/record emission. Skipped where the ccusage binary isn't installed.
     """
 
-    def _records(self):
+    def _records(self, pricing_rates=None):
         records = []
         collector = CcusageCollector(
             claude_dirs=[str(CLAUDE_FIXTURE_DIR)],
             days_back=UNBOUNDED_DAYS_BACK,
             on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates=pricing_rates,
         )
         collector.scan_history()
         return records
@@ -270,12 +271,29 @@ class TestClaudeFixtureGroundTruth:
             }
         assert got == CLAUDE_FIXTURE_GROUND_TRUTH
 
-    def test_opus_4_8_is_priced(self):
-        # Cost comes from ccusage's offline pricing snapshot. The exact value
-        # drifts across ccusage versions, so assert only that opus-4-8 is priced
-        # (> 0) — this is the regression that started the whole investigation:
-        # opus-4-8 showing $0 in "Cost by Model".
-        records = self._records()
+    def test_opus_4_8_priced_from_token_deltas(self):
+        # Cost is computed in-process from token deltas via pricing.cost_for(),
+        # NOT taken from ccusage's offline snapshot. Asserting the exact
+        # token-derived value (not just > 0) is what catches a wrong rate card —
+        # the 3x legacy-Opus overcharge that started this investigation would
+        # fail here. Official Opus 4.8 rates, per 1M tokens.
+        rates = {
+            "claude-opus-4-8": {
+                "input": 5.0,
+                "output": 25.0,
+                "cached": 0.5,
+                "cache_creation": 6.25,
+            }
+        }
+        records = self._records(pricing_rates=rates)
         opus = [rec for _, rec in records if rec["model"] == "claude-opus-4-8"]
         assert opus, "no claude-opus-4-8 records emitted"
-        assert all(rec["cost_usd"] > 0 for rec in opus)
+        for rec in opus:
+            expected = (
+                rec["input_tokens"] * 5.0
+                + rec["cache_read_tokens"] * 0.5
+                + rec["output_tokens"] * 25.0
+                + rec["cache_creation_tokens"] * 6.25
+            ) / 1_000_000
+            assert rec["cost_usd"] == pytest.approx(expected)
+            assert rec["cost_usd"] > 0
