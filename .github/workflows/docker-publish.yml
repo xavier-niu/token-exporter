@@ -1,51 +1,52 @@
 name: Publish Docker image
 
 # Build and push the exporter image to Docker Hub on every push to main
-# (tag `latest` + the commit SHA) and on version tags `v*` (semver tags).
+# (tags `latest` + `git-<short-sha>`) or on manual dispatch. Modeled on
+# linux-services/.github/workflows/publish-images.yml (single-image variant).
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+  workflow_dispatch:
 
 concurrency:
   group: docker-publish-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE: xavierniu/token-exporter
+  DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
+  IMAGE_NAME: token-exporter
+  TGGW_MESSAGES_URL: ${{ vars.TGGW_MESSAGES_URL || 'https://tggw.xavierniu.cc/api/messages' }}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Log in before Buildx setup so Buildx's moby/buildkit image pull is
       # authenticated (anonymous Docker Hub pulls get rate-limited on runners).
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Derive image tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+            type=sha,format=short,prefix=git-
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -54,14 +55,50 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Notify Telegram via tggw only for main (where `latest` is published).
       - name: Notify tggw
-        if: github.ref == 'refs/heads/main'
+        if: success()
         env:
           TGGW_API_TOKEN: ${{ secrets.TGGW_API_TOKEN }}
+          IMAGE_NAME: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          curl -fsS -X POST https://tggw.xavierniu.cc/api/messages \
+          set -euo pipefail
+          tag="latest"
+          hub_url="https://hub.docker.com/r/${IMAGE_NAME}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          commit_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          digest_hex="${IMAGE_DIGEST#sha256:}"
+          short_digest="${digest_hex:0:8}"
+          short_sha="${GITHUB_SHA:0:8}"
+          message="$(printf '%s\n' \
+            "<b>GitHub Actions</b>" \
+            "Docker image <a href=\"${hub_url}\">${IMAGE_NAME}:${tag}</a> has been pushed" \
+            "digest: ${short_digest}" \
+            "commit: <a href=\"${commit_url}\">${short_sha}</a>" \
+            "link: <a href=\"${run_url}\">GitHub Workflow</a>")"
+
+          curl -fsS -X POST "$TGGW_MESSAGES_URL" \
             -H "Authorization: Bearer ${TGGW_API_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg t "${IMAGE}:latest has been updated to docker hub, SHA is ${IMAGE_DIGEST}" '{text: $t}')"
+            -d "$(jq -n --arg text "$message" '{text: $text, parse_mode: "HTML"}')"
+
+      - name: Notify tggw on failure
+        if: failure()
+        env:
+          TGGW_API_TOKEN: ${{ secrets.TGGW_API_TOKEN }}
+          IMAGE_NAME: ${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          commit_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+          short_sha="${GITHUB_SHA:0:8}"
+          message="$(printf '%s\n' \
+            "<b>GitHub Actions</b>" \
+            "Docker image ${IMAGE_NAME} publish failed" \
+            "commit: <a href=\"${commit_url}\">${short_sha}</a>" \
+            "link: <a href=\"${run_url}\">GitHub Workflow</a>")"
+
+          curl -fsS -X POST "$TGGW_MESSAGES_URL" \
+            -H "Authorization: Bearer ${TGGW_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg text "$message" '{text: $text, parse_mode: "HTML"}')"
