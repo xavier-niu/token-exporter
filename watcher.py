@@ -427,8 +427,8 @@ def _process_ccusage_data(
                 if not has_delta:
                     continue
 
-                if pricing_rates:
-                    cost_delta = pricing.cost_for(
+                cost_delta = (
+                    pricing.cost_for(
                         pricing_rates,
                         model,
                         delta["input_tokens"],
@@ -436,12 +436,24 @@ def _process_ccusage_data(
                         delta["output_tokens"],
                         delta["cache_creation_tokens"],
                     )
-                elif last is None:
-                    cost_delta = current["cost_usd"]
-                elif "cost_usd" not in last:
-                    cost_delta = 0
-                else:
-                    cost_delta = max(current["cost_usd"] - last.get("cost_usd", 0), 0)
+                    if pricing_rates
+                    else 0.0
+                )
+                if not cost_delta:
+                    # No pricing table, or model not in it (e.g. a model newer
+                    # than the loaded rates): degrade to ccusage's own offline
+                    # cost rather than emitting $0. Once the model lands in
+                    # LiteLLM or the local override, in-process pricing wins.
+                    if last is None:
+                        cost_delta = current["cost_usd"]
+                    elif "cost_usd" not in last:
+                        cost_delta = 0
+                    else:
+                        cost_delta = max(current["cost_usd"] - last.get("cost_usd", 0), 0)
+                    if pricing_rates and cost_delta:
+                        logger.warning(
+                            "no in-process price for model %r; using ccusage cost", model
+                        )
 
                 record = {
                     "timestamp": datetime.fromisoformat(date_str) if date_str else None,
@@ -464,8 +476,11 @@ class CcusageCollector:
 
     Uses ccusage CLI for Claude Code (cc) directories and inline JSONL
     parsing with msg_id dedup for AntCC directories (ccusage doesn't
-    dedup when requestId is empty). AntCC costs are priced from the shared
-    pricing map because the collector cannot use ccusage's raw AntCC totals.
+    dedup when requestId is empty). Costs for both paths are computed
+    in-process from token deltas via the shared pricing map, so they stay
+    correct as rates change without depending on ccusage's bundled offline
+    pricing snapshot; ccusage's own cost is used only as a fallback for a
+    model the pricing map doesn't yet know.
     """
 
     def __init__(
@@ -513,7 +528,13 @@ class CcusageCollector:
                 data = _run_ccusage(claude_dir, since, self.timezone_name)
                 if data is None:
                     continue
-                total_records += _process_ccusage_data(data, agent, self.on_record, self._last_totals)
+                total_records += _process_ccusage_data(
+                    data,
+                    agent,
+                    self.on_record,
+                    self._last_totals,
+                    pricing_rates=self.pricing_rates,
+                )
         if self.state_file:
             _save_last_totals(self.state_file, self._last_totals)
         logger.info("CcusageCollector: emitted %d records", total_records)
