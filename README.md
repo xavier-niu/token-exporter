@@ -57,7 +57,7 @@ docker run -d \
 | `STATE_FILE` | `~/.token-exporter/state.json` (`/etc/token-exporter/state.json` in Docker) | JSON state file for processed offsets, dedup keys, and Codex cumulative counters |
 | `PRICING_FILE` | `/opt/token-exporter/pricing.json` | Optional local pricing override, keyed by model |
 | `PRICING_CACHE` | `~/.token-exporter/pricing-cache.json` | Cached pricing map; official-source caches use sibling files such as `pricing-cache-zai.json` |
-| `PRICING_TTL_SECS` | `86400` | Seconds before refreshing the LiteLLM pricing cache |
+| `PRICING_TTL_SECS` | `3600` | Seconds before refreshing the LiteLLM pricing cache |
 
 ## Pricing
 

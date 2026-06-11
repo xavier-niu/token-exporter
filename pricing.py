@@ -11,7 +11,7 @@ logger = logging.getLogger("token-stats")
 
 LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 ZAI_PRICING_URL = "https://docs.z.ai/guides/overview/pricing"
-DEFAULT_TTL_SECS = 24 * 3600
+DEFAULT_TTL_SECS = 3600
 _RATE_FIELDS = ("input", "output", "cached", "cache_creation")
 _DECIMAL_P_RE = re.compile(r"(?<=\d)p(?=\d)")
 _ZAI_TEXT_MODEL_RE = re.compile(r"\b(GLM-[A-Za-z0-9][A-Za-z0-9.-]*)(?=\s*(?:\$|Free|-))")
