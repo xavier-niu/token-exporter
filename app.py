@@ -42,6 +42,33 @@ def poll_loop(collectors: list, interval: int, counter_state_file: str):
     timer.start()
 
 
+def reload_pricing_loop(collectors: list, config: dict):
+    """Periodically reload pricing so a long-running container picks up new or
+    repriced models without a restart.
+
+    The rates table is otherwise loaded once at startup and frozen for the
+    process lifetime. load_pricing is TTL-gated internally, so the upstream
+    refetch still happens at most once per pricing_ttl_secs; this loop re-runs
+    it on that cadence and swaps the refreshed table into each collector.
+    """
+    interval = config["pricing_ttl_secs"]
+    try:
+        rates = pricing.load_pricing(
+            override_path=config["pricing_override"],
+            cache_path=config["pricing_cache"],
+            ttl=interval,
+        )
+        if rates:
+            for collector in collectors:
+                collector.pricing_rates = rates
+            logger.info("Reloaded pricing for %d models", len(rates))
+    except Exception as e:
+        logger.warning("Pricing reload failed: %s", e)
+    timer = threading.Timer(interval, reload_pricing_loop, args=[collectors, config])
+    timer.daemon = True
+    timer.start()
+
+
 def _install_shutdown_handlers(counter_state_file: str) -> None:
     """Flush counter state on SIGTERM/SIGINT.
 
@@ -211,6 +238,13 @@ def main():
     logger.info("Health endpoint on :%d/health", health_port)
 
     _install_shutdown_handlers(counter_state_file)
+
+    pricing_timer = threading.Timer(
+        config["pricing_ttl_secs"], reload_pricing_loop, args=[collectors, config]
+    )
+    pricing_timer.daemon = True
+    pricing_timer.start()
+    logger.info("Reloading pricing every %ds", config["pricing_ttl_secs"])
 
     logger.info("Watching for updates every %ds...", config["watch_interval"])
     poll_loop(collectors, config["watch_interval"], counter_state_file)
