@@ -7,6 +7,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pricing
+from state_io import atomic_write_json
 
 logger = logging.getLogger("token-stats")
 
@@ -353,20 +354,12 @@ def _load_last_totals(path: str) -> dict[tuple, dict]:
 
 def _save_last_totals(path: str, totals: dict[tuple, dict]) -> None:
     """Persist last-seen totals to a JSON state file."""
-    state_path = Path(path)
-    tmp_path = state_path.with_name(f"{state_path.name}.tmp")
     serializable = {
         "last_totals": {
             "\x00".join(key): values for key, values in totals.items()
         }
     }
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(serializable, f, separators=(",", ":"), sort_keys=True)
-        os.replace(tmp_path, state_path)
-    except OSError as e:
-        logger.error("Could not save state to %s: %s", path, e)
+    atomic_write_json(path, serializable)
 
 
 def _prune_stale_totals(totals: dict[tuple, dict], cutoff: date) -> None:
@@ -471,7 +464,61 @@ def _process_ccusage_data(
     return count
 
 
-class CcusageCollector:
+class _BaseCollector:
+    """Shared state/lifecycle for the per-agent collectors.
+
+    Holds the dedup cursor and the scan window; subclasses implement
+    scan_history() for their data layout. Persistence is split so the frequent
+    poll loop can keep metrics fresh without writing to disk every cycle: a scan
+    updates the in-memory cursor, and the poll loop (or shutdown) flushes it on a
+    slower cadence via flush_state().
+    """
+
+    def __init__(self, dirs, days_back=7, on_record=None, state_file="",
+                 timezone_name="UTC", pricing_rates=None):
+        self.dirs = dirs
+        self.days_back = days_back
+        self.on_record = on_record
+        self.state_file = state_file
+        self.timezone_name = timezone_name
+        self.pricing_rates = pricing_rates or {}
+        self._last_totals: dict[tuple, dict[str, float]] = {}
+        if state_file:
+            self._last_totals = _load_last_totals(state_file)
+            logger.info("Loaded %s state from %s (%d entries)",
+                        type(self).__name__, state_file, len(self._last_totals))
+
+    def _scan_since(self):
+        """Window start date, pruning cursor entries that fell out of it."""
+        since = (_utcnow() - timedelta(days=self.days_back)).date()
+        _prune_stale_totals(self._last_totals, since)
+        return since
+
+    def _finish_scan(self, persist, total_records):
+        if persist and self.state_file:
+            _save_last_totals(self.state_file, self._last_totals)
+        logger.info("%s: emitted %d records", type(self).__name__, total_records)
+
+    def scan_history(self, persist=True):
+        """Scan all configured directories and emit records.
+
+        persist=False updates the in-memory cursor but skips the disk write, so
+        the frequent poll loop can keep metrics fresh while persistence runs on
+        its own slower cadence (see poll_loop).
+        """
+        raise NotImplementedError
+
+    def check_updates(self):
+        """Re-scan for new data; persistence is handled by the poll loop."""
+        self.scan_history(persist=False)
+
+    def flush_state(self):
+        """Persist the dedup cursor without re-scanning (for shutdown)."""
+        if self.state_file:
+            _save_last_totals(self.state_file, self._last_totals)
+
+
+class CcusageCollector(_BaseCollector):
     """Collects token usage from Claude Code / AntCC data directories.
 
     Uses ccusage CLI for Claude Code (cc) directories and inline JSONL
@@ -492,23 +539,13 @@ class CcusageCollector:
         timezone_name: str = "UTC",
         pricing_rates: dict | None = None,
     ):
-        self.claude_dirs = claude_dirs
-        self.days_back = days_back
-        self.on_record = on_record
-        self.state_file = state_file
-        self.timezone_name = timezone_name
-        self.pricing_rates = pricing_rates or {}
-        self._last_totals: dict[tuple, dict[str, float]] = {}
-        if state_file:
-            self._last_totals = _load_last_totals(state_file)
-            logger.info("Loaded CcusageCollector state from %s (%d entries)", state_file, len(self._last_totals))
+        super().__init__(claude_dirs, days_back, on_record, state_file,
+                         timezone_name, pricing_rates)
 
-    def scan_history(self):
-        """Scan all configured directories and emit records."""
-        since = (_utcnow() - timedelta(days=self.days_back)).date()
-        _prune_stale_totals(self._last_totals, since)
+    def scan_history(self, persist=True):
+        since = self._scan_since()
         total_records = 0
-        for claude_dir in self.claude_dirs:
+        for claude_dir in self.dirs:
             if not os.path.isdir(claude_dir):
                 continue
             if not os.path.isdir(os.path.join(claude_dir, "projects")):
@@ -535,16 +572,10 @@ class CcusageCollector:
                     self._last_totals,
                     pricing_rates=self.pricing_rates,
                 )
-        if self.state_file:
-            _save_last_totals(self.state_file, self._last_totals)
-        logger.info("CcusageCollector: emitted %d records", total_records)
-
-    def check_updates(self):
-        """Re-scan for new data (same as scan_history)."""
-        self.scan_history()
+        self._finish_scan(persist, total_records)
 
 
-class CodexCollector:
+class CodexCollector(_BaseCollector):
     """Collects token usage from Codex data directories.
 
     Scans the session JSONL files directly (with cumulative-counter dedup) and
@@ -552,23 +583,13 @@ class CodexCollector:
     """
 
     def __init__(self, codex_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC", pricing_rates: dict | None = None):
-        self.codex_dirs = codex_dirs
-        self.days_back = days_back
-        self.on_record = on_record
-        self.state_file = state_file
-        self.timezone_name = timezone_name
-        self.pricing_rates = pricing_rates or {}
-        self._last_totals: dict[tuple, dict[str, float]] = {}
-        if state_file:
-            self._last_totals = _load_last_totals(state_file)
-            logger.info("Loaded CodexCollector state from %s (%d entries)", state_file, len(self._last_totals))
+        super().__init__(codex_dirs, days_back, on_record, state_file,
+                         timezone_name, pricing_rates)
 
-    def scan_history(self):
-        """Scan all configured Codex directories and emit records."""
-        since = (_utcnow() - timedelta(days=self.days_back)).date()
-        _prune_stale_totals(self._last_totals, since)
+    def scan_history(self, persist=True):
+        since = self._scan_since()
         total_records = 0
-        for codex_dir in self.codex_dirs:
+        for codex_dir in self.dirs:
             if not os.path.isdir(codex_dir):
                 continue
             if not os.path.isdir(os.path.join(codex_dir, "sessions")):
@@ -583,10 +604,4 @@ class CodexCollector:
                 self._last_totals,
                 pricing_rates=self.pricing_rates,
             )
-        if self.state_file:
-            _save_last_totals(self.state_file, self._last_totals)
-        logger.info("CodexCollector: emitted %d records", total_records)
-
-    def check_updates(self):
-        """Re-scan for new data (same as scan_history)."""
-        self.scan_history()
+        self._finish_scan(persist, total_records)

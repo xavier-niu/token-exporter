@@ -39,7 +39,7 @@ docker run -d \
   -v ~/.claude:/root/.claude:ro \
   -v ~/.codefuse:/root/.codefuse:ro \
   -v ~/.codex:/root/.codex:ro \
-  -v ~/.token-exporter:/etc/token-exporter \
+  -v ~/.token-exporter:/root/.token-exporter \
   -e SOURCE=devhome \
   xavierniu/token-exporter:latest
 ```
@@ -49,12 +49,13 @@ docker run -d \
 | Env Var | Default | Description |
 |---|---|---|
 | `LISTEN_PORT` | `14531` | Prometheus metrics port |
-| `WATCH_INTERVAL` | `60` | Seconds between file checks |
+| `WATCH_INTERVAL` | `60` | Seconds between rescans (how fresh the exposed metrics are) |
+| `PERSIST_INTERVAL` | `600` | Seconds between state-file flushes; a crash re-emits at most this much usage on restart (idempotent, no double count) |
 | `CLAUDE_CONFIG_DIR` | `~/.claude,~/.codefuse/engine/cc` | Comma-separated Claude Code/AntCC config directories using `projects/` subdirs |
 | `CODEX_CONFIG_DIR` | `~/.codex,~/.codefuse/engine/codex` | Comma-separated Codex/CodeFuse Codex config directories using `sessions/` subdirs |
 | `DAYS_BACK` | `7` | Days of history to scan on startup |
 | `SOURCE` | `""` | Source label for multi-machine setups |
-| `STATE_FILE` | `~/.token-exporter/state.json` (`/etc/token-exporter/state.json` in Docker) | JSON state file for processed offsets, dedup keys, and Codex cumulative counters |
+| `STATE_FILE` | `~/.token-exporter/state.json` (`/root/.token-exporter/state.json` in Docker, since the container runs as root) | JSON state file for processed offsets, dedup keys, and Codex cumulative counters. Mount this directory to a host volume or counters/dedup state are lost on container recreation. |
 | `PRICING_FILE` | `/opt/token-exporter/pricing.json` | Optional local pricing override, keyed by model |
 | `PRICING_CACHE` | `~/.token-exporter/pricing-cache.json` | Cached pricing map; official-source caches use sibling files such as `pricing-cache-zai.json` |
 | `PRICING_TTL_SECS` | `3600` | Seconds before refreshing the LiteLLM pricing cache |

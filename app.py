@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from prometheus_client import start_http_server
@@ -32,12 +33,39 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-def poll_loop(collectors: list, interval: int, counter_state_file: str):
+def _persist_all(collectors: list, counter_state_file: str) -> None:
+    """Flush both state files, dedup cursors before the counter snapshot.
+
+    The restart merge assumes collector offsets are written before the counter
+    snapshot, and the two must be written together so a crash leaves them at the
+    same point in time (a stale cursor with a fresh counter double-counts the
+    gap on the next start).
+    """
+    for collector in collectors:
+        collector.flush_state()
+    if counter_state_file:
+        save_state(counter_state_file)
+
+
+def poll_loop(collectors: list, interval: int, persist_interval: int,
+              counter_state_file: str, next_persist: float | None = None):
+    """Scan every `interval` so metrics stay fresh, but flush to disk only every
+    `persist_interval`. Persisting less often keeps fsync off the frequent poll
+    path; a crash then re-emits at most one persist_interval of usage on restart,
+    which is idempotent because the cursor and counter snapshot advance together.
+    """
+    now = time.monotonic()
+    if next_persist is None:
+        next_persist = now + persist_interval
     for collector in collectors:
         collector.check_updates()
-        if counter_state_file:
-            save_state(counter_state_file)
-    timer = threading.Timer(interval, poll_loop, args=[collectors, interval, counter_state_file])
+    if now >= next_persist:
+        _persist_all(collectors, counter_state_file)
+        next_persist = now + persist_interval
+    timer = threading.Timer(
+        interval, poll_loop,
+        args=[collectors, interval, persist_interval, counter_state_file, next_persist],
+    )
     timer.daemon = True
     timer.start()
 
@@ -69,19 +97,21 @@ def reload_pricing_loop(collectors: list, config: dict):
     timer.start()
 
 
-def _install_shutdown_handlers(counter_state_file: str) -> None:
-    """Flush counter state on SIGTERM/SIGINT.
+def _install_shutdown_handlers(counter_state_file: str, collectors: list) -> None:
+    """Flush all persisted state on SIGTERM/SIGINT.
 
+    Both the collector dedup cursors and the counter snapshot are written, in
+    that order, so the two files stay consistent (the restart merge assumes
+    collector offsets precede the counter snapshot). Flushing the cursors too
+    matters once the poll interval is long: a fresh counter snapshot paired with
+    a stale cursor would make the next start re-emit and double-count the gap.
     SIGKILL cannot be intercepted; on SIGKILL the snapshot is at most one
     poll-cycle stale, which is the unavoidable bound.
     """
-    if not counter_state_file:
-        return
-
     def _handler(signum, _frame):
-        logger.info("Received signal %d, flushing counter state", signum)
+        logger.info("Received signal %d, flushing state", signum)
         try:
-            save_state(counter_state_file)
+            _persist_all(collectors, counter_state_file)
         finally:
             sys.exit(0)
 
@@ -237,7 +267,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     logger.info("Health endpoint on :%d/health", health_port)
 
-    _install_shutdown_handlers(counter_state_file)
+    _install_shutdown_handlers(counter_state_file, collectors)
 
     pricing_timer = threading.Timer(
         config["pricing_ttl_secs"], reload_pricing_loop, args=[collectors, config]
@@ -246,8 +276,13 @@ def main():
     pricing_timer.start()
     logger.info("Reloading pricing every %ds", config["pricing_ttl_secs"])
 
-    logger.info("Watching for updates every %ds...", config["watch_interval"])
-    poll_loop(collectors, config["watch_interval"], counter_state_file)
+    logger.info(
+        "Watching for updates every %ds, persisting every %ds",
+        config["watch_interval"], config["persist_interval"],
+    )
+    poll_loop(
+        collectors, config["watch_interval"], config["persist_interval"], counter_state_file
+    )
 
     threading.Event().wait()
 

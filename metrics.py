@@ -1,10 +1,10 @@
 import json
 import logging
-import os
 from collections import defaultdict
-from pathlib import Path
 
 from prometheus_client import Counter, Gauge
+
+from state_io import atomic_write_json
 
 logger = logging.getLogger("token-stats")
 
@@ -142,12 +142,4 @@ def load_state(path: str) -> dict:
 
 
 def save_state(path: str) -> None:
-    state_path = Path(path)
-    tmp_path = state_path.with_name(f"{state_path.name}.tmp")
-    try:
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp_path, "w") as f:
-            json.dump(snapshot_state(), f, separators=(",", ":"), sort_keys=True)
-        os.replace(tmp_path, state_path)
-    except OSError as e:
-        logger.error("Could not save metrics state to %s: %s", path, e)
+    atomic_write_json(path, snapshot_state())
