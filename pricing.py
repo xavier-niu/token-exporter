@@ -7,6 +7,8 @@ from html import unescape
 from pathlib import Path
 from time import time
 
+from state_io import atomic_write_json
+
 logger = logging.getLogger("token-stats")
 
 LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
@@ -142,13 +144,8 @@ def _refresh_cache(cache_path: str, ttl: int) -> dict:
     data = _fetch_litellm()
     if data is None:
         return _load_json(cache_path)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump(data, f)
+    if atomic_write_json(cache_path, data):
         logger.info("Refreshed LiteLLM pricing cache (%d models)", len(data))
-    except OSError as e:
-        logger.warning("Could not write pricing cache %s: %s", cache_path, e)
     return data
 
 
@@ -165,13 +162,8 @@ def _refresh_zai_cache(cache_path: str, ttl: int) -> dict:
     data = _fetch_zai_pricing()
     if data is None:
         return _load_json(cache_path)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_path, "w") as f:
-            json.dump(data, f)
+    if atomic_write_json(cache_path, data):
         logger.info("Refreshed Z.ai pricing cache (%d models)", len(data))
-    except OSError as e:
-        logger.warning("Could not write pricing cache %s: %s", cache_path, e)
     return data
 
 

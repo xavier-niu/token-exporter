@@ -10,9 +10,16 @@ def load_config():
     codex_dirs = os.environ.get("CODEX_CONFIG_DIR", default_codex_paths)
     codex_paths = [os.path.expanduser(p.strip()) for p in codex_dirs.split(",") if p.strip()]
 
+    watch_interval = int(os.environ.get("WATCH_INTERVAL", "60"))
+    # Persisting more often than we scan is pointless (state only changes on a
+    # scan) and a non-positive value would fsync every cycle; floor at the scan
+    # interval.
+    persist_interval = max(int(os.environ.get("PERSIST_INTERVAL", "600")), watch_interval)
+
     return {
         "listen_port": int(os.environ.get("LISTEN_PORT", "14531")),
-        "watch_interval": int(os.environ.get("WATCH_INTERVAL", "60")),
+        "watch_interval": watch_interval,
+        "persist_interval": persist_interval,
         "claude_dirs": claude_paths,
         "codex_dirs": codex_paths,
         "days_back": int(os.environ.get("DAYS_BACK", "7")),
