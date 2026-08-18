@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import subprocess
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -243,8 +244,132 @@ def _codex_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
     return delta
 
 
-def _scan_antcodex_dir(codex_dir: str, since: date, timezone_name: str = "UTC", pricing_rates: dict | None = None) -> dict:
-    """Scan AntCodex JSONL token_count events with cumulative-counter dedup."""
+_CODEX_TOTAL_FIELDS = (
+    "inputTokens",
+    "outputTokens",
+    "cacheCreationTokens",
+    "cacheReadTokens",
+)
+
+
+@dataclass
+class _CodexFileCacheEntry:
+    signature: tuple[int, int, int, int]
+    since: str
+    totals: dict
+
+
+def _codex_file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+    )
+
+
+def _prune_codex_totals(totals: dict, since_local: str) -> None:
+    """Drop cached daily aggregates that have left the configured window."""
+    for project, dates in list(totals.items()):
+        for date_str in list(dates):
+            if date_str < since_local:
+                del dates[date_str]
+        if not dates:
+            del totals[project]
+
+
+def _merge_codex_totals(target: dict, source: dict) -> None:
+    for project, dates in source.items():
+        for date_str, models in dates.items():
+            date_models = target.setdefault(project, {}).setdefault(date_str, {})
+            for model, source_tokens in models.items():
+                tokens = date_models.setdefault(
+                    model,
+                    {field: 0 for field in _CODEX_TOTAL_FIELDS},
+                )
+                for field in _CODEX_TOTAL_FIELDS:
+                    tokens[field] += source_tokens.get(field, 0)
+
+
+def _parse_codex_session_file(
+    session_file: Path,
+    since_local: str,
+    tz: ZoneInfo,
+) -> dict | None:
+    """Parse one session into reusable per-project/model/day totals.
+
+    None means the file could not be read. An empty dict is a successful parse
+    with no in-window token records (and is cacheable).
+    """
+    agg: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+    project = "unknown"
+    model = "unknown"
+    previous: dict[str, int] | None = None
+
+    try:
+        with open(session_file, "r") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                payload = obj.get("payload", {})
+                entry_type = obj.get("type")
+                if entry_type == "session_meta":
+                    project = _project_from_cwd(payload.get("cwd", "")) or project
+                    continue
+                if entry_type == "turn_context":
+                    if payload.get("cwd"):
+                        project = _project_from_cwd(payload["cwd"])
+                    if payload.get("model"):
+                        model = payload["model"]
+                    continue
+                if entry_type != "event_msg" or payload.get("type") != "token_count":
+                    continue
+
+                info = payload.get("info") or {}
+                current = _codex_usage_totals(info)
+                if not any(current.values()):
+                    continue
+
+                delta = _codex_delta(current, previous)
+                previous = current
+                if not any(value > 0 for value in delta.values()):
+                    continue
+
+                ts_str = obj.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                date_str = ts.astimezone(tz).date().isoformat()
+                if date_str < since_local:
+                    continue
+
+                date_models = agg.setdefault(project, {}).setdefault(date_str, {})
+                tokens = date_models.setdefault(
+                    model,
+                    {field: 0 for field in _CODEX_TOTAL_FIELDS},
+                )
+                cached = max(delta["cached"], 0)
+                tokens["inputTokens"] += max(delta["input"] - cached, 0)
+                tokens["outputTokens"] += max(delta["output"], 0)
+                tokens["cacheReadTokens"] += cached
+    except OSError:
+        return None
+
+    return agg
+
+
+def _scan_antcodex_dir(
+    codex_dir: str,
+    since: date,
+    timezone_name: str = "UTC",
+    pricing_rates: dict | None = None,
+    file_cache: dict[str, _CodexFileCacheEntry] | None = None,
+) -> dict:
+    """Scan Codex JSONL sessions, reusing aggregates for unchanged files."""
     tz = ZoneInfo(timezone_name)
     since_local = since.isoformat()
     sessions_dir = Path(codex_dir) / "sessions"
@@ -252,73 +377,48 @@ def _scan_antcodex_dir(codex_dir: str, since: date, timezone_name: str = "UTC", 
     if not sessions_dir.is_dir():
         return result
 
-    agg: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+    if file_cache is None:
+        file_cache = {}
+    seen: set[str] = set()
+    agg: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
+
     for session_file in sorted(sessions_dir.rglob("*.jsonl")):
-        project = "unknown"
-        model = "unknown"
-        previous: dict[str, int] | None = None
-
+        cache_key = os.fspath(session_file)
+        seen.add(cache_key)
+        cached = file_cache.get(cache_key)
         try:
-            with open(session_file, "r") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    payload = obj.get("payload", {})
-                    entry_type = obj.get("type")
-                    if entry_type == "session_meta":
-                        project = _project_from_cwd(payload.get("cwd", "")) or project
-                        continue
-                    if entry_type == "turn_context":
-                        if payload.get("cwd"):
-                            project = _project_from_cwd(payload["cwd"])
-                        if payload.get("model"):
-                            model = payload["model"]
-                        continue
-                    if entry_type != "event_msg" or payload.get("type") != "token_count":
-                        continue
-
-                    info = payload.get("info") or {}
-                    current = _codex_usage_totals(info)
-                    if not any(current.values()):
-                        continue
-
-                    delta = _codex_delta(current, previous)
-                    previous = current
-                    if not any(value > 0 for value in delta.values()):
-                        continue
-
-                    ts_str = obj.get("timestamp", "")
-                    try:
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except (ValueError, TypeError):
-                        continue
-                    date_str = ts.astimezone(tz).date().isoformat()
-                    if date_str < since_local:
-                        continue
-
-                    date_models = agg.setdefault(project, {}).setdefault(date_str, {})
-                    tokens = date_models.setdefault(model, {
-                        "inputTokens": 0,
-                        "outputTokens": 0,
-                        "cacheCreationTokens": 0,
-                        "cacheReadTokens": 0,
-                        "cost": 0,
-                    })
-                    cached = max(delta["cached"], 0)
-                    input_delta = max(delta["input"] - cached, 0)
-                    output_delta = max(delta["output"], 0)
-                    tokens["inputTokens"] += input_delta
-                    tokens["outputTokens"] += output_delta
-                    tokens["cacheReadTokens"] += cached
-                    if pricing_rates:
-                        tokens["cost"] += pricing.cost_for(
-                            pricing_rates, model, input_delta, cached, output_delta
-                        )
+            signature = _codex_file_signature(session_file.stat())
         except OSError:
+            if cached:
+                if cached.since < since_local:
+                    _prune_codex_totals(cached.totals, since_local)
+                    cached.since = since_local
+                _merge_codex_totals(agg, cached.totals)
             continue
+
+        if cached and cached.signature == signature and cached.since <= since_local:
+            if cached.since < since_local:
+                _prune_codex_totals(cached.totals, since_local)
+                cached.since = since_local
+            file_totals = cached.totals
+        else:
+            file_totals = _parse_codex_session_file(session_file, since_local, tz)
+            if file_totals is None:
+                if cached:
+                    if cached.since < since_local:
+                        _prune_codex_totals(cached.totals, since_local)
+                        cached.since = since_local
+                    _merge_codex_totals(agg, cached.totals)
+                continue
+            file_cache[cache_key] = _CodexFileCacheEntry(
+                signature=signature,
+                since=since_local,
+                totals=file_totals,
+            )
+        _merge_codex_totals(agg, file_totals)
+
+    for cache_key in file_cache.keys() - seen:
+        del file_cache[cache_key]
 
     for project, dates in sorted(agg.items()):
         entries = []
@@ -326,7 +426,18 @@ def _scan_antcodex_dir(codex_dir: str, since: date, timezone_name: str = "UTC", 
             entries.append({
                 "date": date_str,
                 "modelBreakdowns": [
-                    {"modelName": model, **tokens}
+                    {
+                        "modelName": model,
+                        **tokens,
+                        "cost": pricing.cost_for(
+                            pricing_rates,
+                            model,
+                            tokens["inputTokens"],
+                            tokens["cacheReadTokens"],
+                            tokens["outputTokens"],
+                            tokens["cacheCreationTokens"],
+                        ) if pricing_rates else 0,
+                    }
                     for model, tokens in sorted(models.items())
                 ],
             })
@@ -585,6 +696,7 @@ class CodexCollector(_BaseCollector):
     def __init__(self, codex_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC", pricing_rates: dict | None = None):
         super().__init__(codex_dirs, days_back, on_record, state_file,
                          timezone_name, pricing_rates)
+        self._file_caches: dict[str, dict[str, _CodexFileCacheEntry]] = {}
 
     def scan_history(self, persist=True):
         since = self._scan_since()
@@ -596,7 +708,15 @@ class CodexCollector(_BaseCollector):
                 logger.debug("Skipping %s: no sessions/ directory", codex_dir)
                 continue
             agent = _detect_agent(codex_dir)
-            data = _scan_antcodex_dir(codex_dir, since, self.timezone_name, self.pricing_rates)
+            cache_key = os.path.abspath(codex_dir)
+            file_cache = self._file_caches.setdefault(cache_key, {})
+            data = _scan_antcodex_dir(
+                codex_dir,
+                since,
+                self.timezone_name,
+                self.pricing_rates,
+                file_cache=file_cache,
+            )
             total_records += _process_ccusage_data(
                 data,
                 agent,

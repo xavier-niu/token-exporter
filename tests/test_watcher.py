@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import watcher
 from watcher import CcusageCollector, CodexCollector, _extract_project
 
 # Committed, sanitized samples of real agent data directories (see fixtures/README.md).
@@ -35,6 +37,48 @@ def _codex_ts(day: date, second: int) -> str:
     """An ISO-8601 UTC timestamp at 10:00 on `day` (well clear of midnight so it
     stays on the same calendar day under any test timezone)."""
     return f"{day.isoformat()}T10:00:{second:02d}Z"
+
+
+def _codex_session_rows(
+    day: date,
+    usages: list[tuple[int, int, int]],
+    project: str = "proj",
+    model: str = "gpt-5",
+) -> list[dict]:
+    rows = [
+        {
+            "timestamp": _codex_ts(day, 0),
+            "type": "session_meta",
+            "payload": {"cwd": f"/home/user/developer/{project}"},
+        },
+        {
+            "timestamp": _codex_ts(day, 1),
+            "type": "turn_context",
+            "payload": {
+                "cwd": f"/home/user/developer/{project}",
+                "model": model,
+            },
+        },
+    ]
+    for second, (input_tokens, cached_tokens, output_tokens) in enumerate(usages, 2):
+        rows.append({
+            "timestamp": _codex_ts(day, second),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {
+                    "input_tokens": input_tokens,
+                    "cached_input_tokens": cached_tokens,
+                    "output_tokens": output_tokens,
+                }},
+            },
+        })
+    return rows
+
+
+def _write_codex_session(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
 
 SAMPLE_CCUSAGE_INSTANCES = {
@@ -386,6 +430,225 @@ class TestAntccFixture(unittest.TestCase):
 
 
 class TestCodexCollector(unittest.TestCase):
+    def test_unchanged_scan_does_not_reopen_jsonl_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            _write_codex_session(
+                session_file,
+                _codex_session_rows(_DAY1, [(1000, 400, 50)]),
+            )
+            records = []
+            collector = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                on_record=lambda agent, rec: records.append((agent, rec)),
+            )
+
+            collector.scan_history()
+            with patch(
+                "watcher.open",
+                side_effect=AssertionError("unchanged JSONL file was reopened"),
+                create=True,
+            ):
+                collector.scan_history()
+
+        assert len(records) == 1
+
+    def test_append_increments_metrics_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            rows = _codex_session_rows(_DAY1, [(1000, 400, 50)])
+            _write_codex_session(session_file, rows)
+            records = []
+            collector = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                on_record=lambda agent, rec: records.append((agent, rec)),
+            )
+            collector.scan_history()
+            records.clear()
+
+            appended = _codex_session_rows(_DAY1, [(1500, 700, 80)])[-1]
+            with session_file.open("a") as f:
+                f.write(json.dumps(appended) + "\n")
+            collector.scan_history()
+            collector.scan_history()
+
+        assert len(records) == 1
+        _, record = records[0]
+        assert record["input_tokens"] == 200
+        assert record["cache_read_tokens"] == 300
+        assert record["output_tokens"] == 30
+
+    def test_new_session_file_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            sessions_dir = codex_dir / "sessions"
+            _write_codex_session(
+                sessions_dir / "first.jsonl",
+                _codex_session_rows(_DAY1, [(1000, 400, 50)], project="first"),
+            )
+            records = []
+            collector = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                on_record=lambda agent, rec: records.append((agent, rec)),
+            )
+            collector.scan_history()
+            records.clear()
+
+            _write_codex_session(
+                sessions_dir / "second.jsonl",
+                _codex_session_rows(_DAY1, [(500, 100, 20)], project="second"),
+            )
+            collector.scan_history()
+
+        assert len(records) == 1
+        _, record = records[0]
+        assert record["project"] == "second"
+        assert record["input_tokens"] == 400
+        assert record["cache_read_tokens"] == 100
+
+    def test_deleted_session_file_is_evicted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            _write_codex_session(
+                session_file,
+                _codex_session_rows(_DAY1, [(1000, 400, 50)]),
+            )
+            collector = CodexCollector(codex_dirs=[str(codex_dir)])
+            collector.scan_history()
+            directory_cache = collector._file_caches[os.path.abspath(codex_dir)]
+            assert len(directory_cache) == 1
+
+            session_file.unlink()
+            collector.scan_history()
+
+        assert directory_cache == {}
+
+    def test_truncation_and_replacement_invalidate_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            _write_codex_session(
+                session_file,
+                _codex_session_rows(_DAY1, [(1000, 0, 50)]),
+            )
+            records = []
+            collector = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                on_record=lambda agent, rec: records.append((agent, rec)),
+            )
+            collector.scan_history()
+            records.clear()
+
+            with patch(
+                "watcher._parse_codex_session_file",
+                wraps=watcher._parse_codex_session_file,
+            ) as parse_file:
+                _write_codex_session(
+                    session_file,
+                    _codex_session_rows(_DAY1, [(100, 0, 10)]),
+                )
+                collector.scan_history()
+
+                replacement = session_file.with_suffix(".replacement")
+                _write_codex_session(
+                    replacement,
+                    _codex_session_rows(_DAY1, [(150, 0, 15)]),
+                )
+                replacement.replace(session_file)
+                collector.scan_history()
+
+        assert parse_file.call_count == 2
+        assert len(records) == 1
+        assert records[0][1]["input_tokens"] == 50
+        assert records[0][1]["output_tokens"] == 5
+
+    def test_partial_final_line_is_processed_when_completed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            rows = _codex_session_rows(
+                _DAY1,
+                [(1000, 400, 50), (1500, 700, 80)],
+            )
+            complete_prefix = "\n".join(json.dumps(row) for row in rows[:-1]) + "\n"
+            final_line = json.dumps(rows[-1])
+            split_at = len(final_line) // 2
+            session_file.parent.mkdir(parents=True)
+            session_file.write_text(complete_prefix + final_line[:split_at])
+            records = []
+            collector = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                on_record=lambda agent, rec: records.append((agent, rec)),
+            )
+            collector.scan_history()
+            records.clear()
+
+            with session_file.open("a") as f:
+                f.write(final_line[split_at:] + "\n")
+            collector.scan_history()
+
+        assert len(records) == 1
+        _, record = records[0]
+        assert record["input_tokens"] == 200
+        assert record["cache_read_tokens"] == 300
+        assert record["output_tokens"] == 30
+
+    def test_cached_totals_are_pruned_when_day_leaves_window(self):
+        initial_now = datetime.combine(_DAY2, datetime.min.time(), timezone.utc)
+        later_now = initial_now + timedelta(days=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            session_file = codex_dir / "sessions" / "rollout.jsonl"
+            _write_codex_session(
+                session_file,
+                _codex_session_rows(_DAY1, [(1000, 400, 50)]),
+            )
+            collector = CodexCollector(codex_dirs=[str(codex_dir)], days_back=7)
+
+            with patch("watcher._utcnow", return_value=initial_now):
+                collector.scan_history()
+            with patch("watcher._utcnow", return_value=later_now), patch(
+                "watcher._parse_codex_session_file",
+                wraps=watcher._parse_codex_session_file,
+            ) as parse_file:
+                collector.scan_history()
+
+            directory_cache = collector._file_caches[os.path.abspath(codex_dir)]
+
+        parse_file.assert_not_called()
+        assert len(directory_cache) == 1
+        assert next(iter(directory_cache.values())).totals == {}
+
+    def test_restart_does_not_duplicate_persisted_counters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            state_file = Path(tmp) / "codex-state.json"
+            _write_codex_session(
+                codex_dir / "sessions" / "rollout.jsonl",
+                _codex_session_rows(_DAY1, [(1000, 400, 50)]),
+            )
+            first_records = []
+            first = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                state_file=str(state_file),
+                on_record=lambda agent, rec: first_records.append((agent, rec)),
+            )
+            first.scan_history()
+
+            restarted_records = []
+            restarted = CodexCollector(
+                codex_dirs=[str(codex_dir)],
+                state_file=str(state_file),
+                on_record=lambda agent, rec: restarted_records.append((agent, rec)),
+            )
+            restarted.scan_history()
+
+        assert len(first_records) == 1
+        assert restarted_records == []
+
     def test_antcodex_parser_emits_project_records_and_skips_duplicate_token_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex_dir = Path(tmp) / "codex"
