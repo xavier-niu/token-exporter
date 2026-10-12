@@ -79,6 +79,67 @@ and `moonshot/` for Kimi, rather than third-party-hosted copies.
 
 ## Metrics
 
+Projects use the working directory's basename for every agent. Claude Code
+and AntCC read the original path from `sessions-index.json` (`originalPath`)
+or the parent session's JSONL `cwd`; Codex uses its session metadata. Thus
+`/home/byte/developer/vefaas-sandbox-infra`, `/scratch/vefaas-sandbox-infra`,
+and deeper paths all report `vefaas-sandbox-infra`, preserving literal
+hyphens, dots, and underscores. Different checkouts with the same basename
+are intentionally combined. Claude directories without readable cwd metadata
+are skipped and retried, rather than guessing from the lossy encoded key.
+
+Existing installations must migrate persisted project labels once before
+starting this version; fresh installations need no migration. The standalone
+[`migrate_project_names.py`](migrate_project_names.py) script handles the
+collector cursors, cumulative counters, daily totals, and costs together.
+It is not invoked by the application, `install.sh`, or `remove.sh`.
+
+Build/publish the updated image before the maintenance window. From this
+checkout on the exporter host, preview with all monitored Claude/AntCC config
+directories (repeat `--claude-dir` for each user):
+
+```bash
+sudo docker run --rm --volumes-from token-exporter:ro \
+  --mount "type=bind,src=$PWD,dst=/migration,readonly" --workdir /migration \
+  --entrypoint python xavierniu/token-exporter:latest \
+  migrate_project_names.py --state-file /root/.token-exporter/state.json \
+  --claude-dir /home/byte/.claude \
+  --claude-dir /home/byte/.codefuse/engine/cc
+```
+
+After reviewing the preview, stop the exporter and apply using the same
+paths. Use the configured `STATE_FILE` if it differs from the example:
+
+```bash
+sudo docker stop token-exporter
+sudo docker run --rm --volumes-from token-exporter \
+  --mount "type=bind,src=$PWD,dst=/migration,readonly" --workdir /migration \
+  --entrypoint python xavierniu/token-exporter:latest \
+  migrate_project_names.py --state-file /root/.token-exporter/state.json \
+  --claude-dir /home/byte/.claude \
+  --claude-dir /home/byte/.codefuse/engine/cc --apply
+```
+
+Then recreate the exporter with the updated image and its existing mounts
+and environment. Do not restart the old image with migrated state. Verify
+the `/metrics` project labels and unchanged totals before resuming normal
+operation. The script keeps exact originals and a mapping manifest in a
+timestamped `project-names-backup-*` directory beside the state files. To
+roll back, stop the exporter and restore **all** files from that backup before
+starting the old image. Keep backups until verification is complete.
+
+Rerunning the script is a no-op for migrated state. Missing or ambiguous
+metadata aborts before changes; supply explicit aliases with `--project-map`,
+for example `{"cc":{"old-project-label":"my-project"}}`, for removed logs
+or confirmed legacy collisions. After all hosts have migrated, remove the
+one-shot script and `tests/test_project_migration.py`.
+
+This migration changes exporter state, not historical samples already stored
+in Prometheus. Renaming cumulative series creates a new label set; queries
+spanning the transition must account for the old series and the restored
+baseline to avoid counting history twice. Keep historical dashboard handling
+separate from the collector's basename rule.
+
 | Metric | Type | Labels |
 |---|---|---|
 | `codeagent_input_tokens_total` | Counter | source, agent, project, model |

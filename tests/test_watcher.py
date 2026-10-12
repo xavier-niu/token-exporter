@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import watcher
-from watcher import CcusageCollector, CodexCollector, _extract_project
+from watcher import CcusageCollector, CodexCollector
 
 # Committed, sanitized samples of real agent data directories (see fixtures/README.md).
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -130,21 +130,17 @@ SAMPLE_CCUSAGE_INSTANCES = {
     }
 }
 
-class TestExtractProject(unittest.TestCase):
-    def test_standard_path(self):
-        assert _extract_project("-home-nxw-developer-token-exporter") == "token-exporter"
-
-    def test_nested_path(self):
-        assert _extract_project("-home-nxw-developer-devkit-ant") == "devkit-ant"
-
-    def test_short_path(self):
-        assert _extract_project("-home-user") == "home-user"
-
-    def test_strips_leading_dashes(self):
-        assert _extract_project("--home-nxw-developer-my-project") == "my-project"
-
-
 class TestCcusageCollector(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate token deltas with mocked ccusage data. Real cwd
+        # discovery is covered by test_projects and the committed fixtures.
+        resolver = patch('watcher.ClaudeProjectResolver.resolve', side_effect=lambda _, key: {
+            '-home-nxw-developer-token-exporter': 'token-exporter',
+            '-home-nxw-developer-devkit-ant': 'devkit-ant',
+        }[key])
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     @patch("watcher.os.path.isdir", return_value=True)
     @patch("watcher._run_ccusage")
     def test_scan_history_emits_records(self, mock_run, mock_isdir):

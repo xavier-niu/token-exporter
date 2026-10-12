@@ -8,6 +8,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pricing
+from projects import (
+    ClaudeProjectResolver, PROJECT_NAME_FORMAT, check_project_name_format, project_from_cwd,
+)
 from state_io import atomic_write_json
 
 logger = logging.getLogger("token-stats")
@@ -37,21 +40,6 @@ def _detect_agent(base_dir: str) -> str:
     if base.lower() == ".claude" or base == "claude":
         return "cc"
     return "unknown"
-
-
-def _extract_project(project_key: str) -> str:
-    """Extract project name from a ccusage --instances project key or directory path.
-
-    The key encodes the working directory with dashes replacing slashes,
-    e.g. '-home-nxw-developer-token-exporter'.
-    Strip the first 3 segments (home, user, developer) and the remainder
-    is the project name.
-    """
-    stripped = project_key.lstrip("-")
-    parts = stripped.split("-")
-    if len(parts) >= 3:
-        return "-".join(parts[3:]) or stripped
-    return stripped
 
 
 def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> dict | None:
@@ -218,12 +206,6 @@ _TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_tokens", "cach
 _STATE_FIELDS = (*_TOKEN_FIELDS, "cost_usd")
 
 
-def _project_from_cwd(cwd: str) -> str:
-    if not cwd:
-        return "unknown"
-    return os.path.basename(os.path.normpath(cwd)) or "unknown"
-
-
 def _codex_usage_totals(info: dict) -> dict[str, int]:
     usage = info.get("total_token_usage") or {}
     return {
@@ -317,11 +299,11 @@ def _parse_codex_session_file(
                 payload = obj.get("payload", {})
                 entry_type = obj.get("type")
                 if entry_type == "session_meta":
-                    project = _project_from_cwd(payload.get("cwd", "")) or project
+                    project = project_from_cwd(payload.get("cwd", "")) or project
                     continue
                 if entry_type == "turn_context":
                     if payload.get("cwd"):
-                        project = _project_from_cwd(payload["cwd"])
+                        project = project_from_cwd(payload["cwd"])
                     if payload.get("model"):
                         model = payload["model"]
                     continue
@@ -442,7 +424,7 @@ def _scan_antcodex_dir(
                 ],
             })
         if entries:
-            result["projects"][f"-home-user-developer-{project}"] = entries
+            result["projects"][project] = entries
     return result
 
 
@@ -456,6 +438,7 @@ def _load_last_totals(path: str) -> dict[tuple, dict]:
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("Could not load state from %s: %s", path, e)
         return {}
+    check_project_name_format(data)
     totals = {}
     for key_str, values in data.get("last_totals", {}).items():
         key = tuple(key_str.split("\x00"))
@@ -466,6 +449,7 @@ def _load_last_totals(path: str) -> dict[tuple, dict]:
 def _save_last_totals(path: str, totals: dict[tuple, dict]) -> None:
     """Persist last-seen totals to a JSON state file."""
     serializable = {
+        "project_name_format": PROJECT_NAME_FORMAT,
         "last_totals": {
             "\x00".join(key): values for key, values in totals.items()
         }
@@ -498,12 +482,15 @@ def _process_ccusage_data(
 
     # Normalize to list of (project, entries) pairs
     if "projects" in data:
-        items = [(_extract_project(k), entries) for k, entries in data["projects"].items()]
+        items = list(data["projects"].items())
     elif "daily" in data:
         items = [(project or "unknown", data["daily"])]
     else:
         return 0
 
+    # Several checkouts/config roots can share a basename. Aggregate before
+    # comparing with the cursor, otherwise each overwrites the other's totals.
+    totals = {}
     for project, entries in items:
         for entry in entries:
             date_str = entry.get("date", "")
@@ -517,61 +504,73 @@ def _process_ccusage_data(
                     "cost_usd": bd.get("cost", 0) or 0,
                 }
                 key = (agent, project, model, date_str)
-                last = last_totals.get(key)
-                if last is None:
-                    delta = {field: current[field] for field in _TOKEN_FIELDS}
-                else:
-                    delta = {
-                        field: max(current[field] - last.get(field, 0), 0)
-                        for field in _TOKEN_FIELDS
-                    }
-                last_totals[key] = current
+                combined = totals.setdefault(key, {field: 0 for field in _STATE_FIELDS})
+                for field, value in current.items():
+                    combined[field] += value or 0
 
-                has_delta = any(delta.get(f, 0) > 0 for f in _TOKEN_FIELDS)
-                if not has_delta:
-                    continue
+    for key, current in totals.items():
+        agent, project, model, date_str = key
+        last = last_totals.get(key)
+        if last is None:
+            delta = {field: current[field] for field in _TOKEN_FIELDS}
+        else:
+            delta = {
+                field: max(current[field] - last.get(field, 0), 0)
+                for field in _TOKEN_FIELDS
+            }
+        # Missing Claude cwd metadata must not lower an aggregate cursor and
+        # replay history when that directory becomes readable again. Codex
+        # keeps its existing cursor behavior for truncated/replaced sessions.
+        last_totals[key] = {
+            field: max(value, (last or {}).get(field, 0))
+            for field, value in current.items()
+        } if agent in ('cc', 'antcc') else current
 
-                cost_delta = (
-                    pricing.cost_for(
-                        pricing_rates,
-                        model,
-                        delta["input_tokens"],
-                        delta["cache_read_tokens"],
-                        delta["output_tokens"],
-                        delta["cache_creation_tokens"],
-                    )
-                    if pricing_rates
-                    else 0.0
+        has_delta = any(delta.get(f, 0) > 0 for f in _TOKEN_FIELDS)
+        if not has_delta:
+            continue
+
+        cost_delta = (
+            pricing.cost_for(
+                pricing_rates,
+                model,
+                delta["input_tokens"],
+                delta["cache_read_tokens"],
+                delta["output_tokens"],
+                delta["cache_creation_tokens"],
+            )
+            if pricing_rates
+            else 0.0
+        )
+        if not cost_delta:
+            # No pricing table, or model not in it (e.g. a model newer
+            # than the loaded rates): degrade to ccusage's own offline
+            # cost rather than emitting $0. Once the model lands in
+            # LiteLLM or the local override, in-process pricing wins.
+            if last is None:
+                cost_delta = current["cost_usd"]
+            elif "cost_usd" not in last:
+                cost_delta = 0
+            else:
+                cost_delta = max(current["cost_usd"] - last.get("cost_usd", 0), 0)
+            if pricing_rates and cost_delta:
+                logger.warning(
+                    "no in-process price for model %r; using ccusage cost", model
                 )
-                if not cost_delta:
-                    # No pricing table, or model not in it (e.g. a model newer
-                    # than the loaded rates): degrade to ccusage's own offline
-                    # cost rather than emitting $0. Once the model lands in
-                    # LiteLLM or the local override, in-process pricing wins.
-                    if last is None:
-                        cost_delta = current["cost_usd"]
-                    elif "cost_usd" not in last:
-                        cost_delta = 0
-                    else:
-                        cost_delta = max(current["cost_usd"] - last.get("cost_usd", 0), 0)
-                    if pricing_rates and cost_delta:
-                        logger.warning(
-                            "no in-process price for model %r; using ccusage cost", model
-                        )
 
-                record = {
-                    "timestamp": datetime.fromisoformat(date_str) if date_str else None,
-                    "model": model,
-                    "project": project,
-                    "input_tokens": delta["input_tokens"],
-                    "output_tokens": delta["output_tokens"],
-                    "cache_creation_tokens": delta["cache_creation_tokens"],
-                    "cache_read_tokens": delta["cache_read_tokens"],
-                    "cost_usd": cost_delta,
-                }
-                if on_record:
-                    on_record(agent, record)
-                count += 1
+        record = {
+            "timestamp": datetime.fromisoformat(date_str) if date_str else None,
+            "model": model,
+            "project": project,
+            "input_tokens": delta["input_tokens"],
+            "output_tokens": delta["output_tokens"],
+            "cache_creation_tokens": delta["cache_creation_tokens"],
+            "cache_read_tokens": delta["cache_read_tokens"],
+            "cost_usd": cost_delta,
+        }
+        if on_record:
+            on_record(agent, record)
+        count += 1
     return count
 
 
@@ -652,11 +651,14 @@ class CcusageCollector(_BaseCollector):
     ):
         super().__init__(claude_dirs, days_back, on_record, state_file,
                          timezone_name, pricing_rates)
+        self.project_resolver = ClaudeProjectResolver()
 
     def scan_history(self, persist=True):
         since = self._scan_since()
         total_records = 0
-        for claude_dir in self.dirs:
+        collected = {}
+        failed_agents = set()
+        for claude_dir in dict.fromkeys(self.dirs):
             if not os.path.isdir(claude_dir):
                 continue
             if not os.path.isdir(os.path.join(claude_dir, "projects")):
@@ -665,24 +667,24 @@ class CcusageCollector(_BaseCollector):
             agent = _detect_agent(claude_dir)
             if agent == "antcc":
                 data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
-                total_records += _process_ccusage_data(
-                    data,
-                    agent,
-                    self.on_record,
-                    self._last_totals,
-                    pricing_rates=self.pricing_rates,
-                )
             else:
                 data = _run_ccusage(claude_dir, since, self.timezone_name)
                 if data is None:
+                    failed_agents.add(agent)
                     continue
-                total_records += _process_ccusage_data(
-                    data,
-                    agent,
-                    self.on_record,
-                    self._last_totals,
-                    pricing_rates=self.pricing_rates,
-                )
+            projects = collected.setdefault(agent, {"projects": {}})["projects"]
+            for key, entries in data.get("projects", {}).items():
+                name = self.project_resolver.resolve(claude_dir, key)
+                if name is None:
+                    continue
+                projects.setdefault(name, []).extend(entries)
+        for agent, data in collected.items():
+            if agent in failed_agents:
+                continue
+            total_records += _process_ccusage_data(
+                data, agent, self.on_record, self._last_totals,
+                pricing_rates=self.pricing_rates,
+            )
         self._finish_scan(persist, total_records)
 
 
@@ -701,7 +703,8 @@ class CodexCollector(_BaseCollector):
     def scan_history(self, persist=True):
         since = self._scan_since()
         total_records = 0
-        for codex_dir in self.dirs:
+        collected = {}
+        for codex_dir in dict.fromkeys(self.dirs):
             if not os.path.isdir(codex_dir):
                 continue
             if not os.path.isdir(os.path.join(codex_dir, "sessions")):
@@ -717,11 +720,12 @@ class CodexCollector(_BaseCollector):
                 self.pricing_rates,
                 file_cache=file_cache,
             )
+            projects = collected.setdefault(agent, {"projects": {}})["projects"]
+            for name, entries in data["projects"].items():
+                projects.setdefault(name, []).extend(entries)
+        for agent, data in collected.items():
             total_records += _process_ccusage_data(
-                data,
-                agent,
-                self.on_record,
-                self._last_totals,
+                data, agent, self.on_record, self._last_totals,
                 pricing_rates=self.pricing_rates,
             )
         self._finish_scan(persist, total_records)

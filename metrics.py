@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from prometheus_client import Counter, Gauge
 
+from projects import PROJECT_NAME_FORMAT, check_project_name_format
 from state_io import atomic_write_json
 
 logger = logging.getLogger("token-stats")
@@ -94,6 +95,7 @@ def record_usage(agent: str, rec: dict):
 def snapshot_state() -> dict:
     return {
         "schema_version": 1,
+        "project_name_format": PROJECT_NAME_FORMAT,
         "cumulative": [{"key": list(k), "values": dict(v)} for k, v in _cumulative_totals.items()],
         "daily": [{"key": list(k), "values": dict(v)} for k, v in _daily_data.items()],
     }
@@ -133,12 +135,14 @@ def restore_state(state: dict) -> None:
 def load_state(path: str) -> dict:
     try:
         with open(path, "r") as f:
-            return json.load(f)
+            state = json.load(f)
     except FileNotFoundError:
         return {}
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("Could not load metrics state from %s: %s", path, e)
         return {}
+    check_project_name_format(state)
+    return state
 
 
 def save_state(path: str) -> None:
