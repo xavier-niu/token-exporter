@@ -11,13 +11,15 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from prometheus_client import REGISTRY, generate_latest
+
 
 def _fresh_metrics():
     """Reload metrics with a clean Prometheus registry.
 
     prometheus_client uses a global default registry that rejects duplicate
     metric names. We unregister every existing collector before reload so the
-    module's top-level Counter/Gauge constructors can re-register cleanly.
+    module's top-level Counter constructors can re-register cleanly.
     """
     from prometheus_client import REGISTRY
     for collector in list(REGISTRY._collector_to_names.keys()):
@@ -185,20 +187,33 @@ class TestRestore(unittest.TestCase):
         m.restore_state({})
         m.restore_state(None)
 
-    def test_restore_seeds_daily_gauges(self):
+    def test_daily_totals_are_saved_but_not_exported(self):
         m = _fresh_metrics()
-        snapshot = {
+        m.set_source("devant")
+        key = ["devant", "cc", "p", "claude", "2026-05-10"]
+        m.restore_state({
             "schema_version": 1,
             "cumulative": [],
             "daily": [{
-                "key": ["devant", "cc", "p", "claude", "2026-05-10"],
+                "key": key,
                 "values": {"input": 200, "output": 100, "cache_creation": 0, "cache_read": 0, "cost": 0.1},
             }],
-        }
-        m.restore_state(snapshot)
-        labels = {"source": "devant", "agent": "cc", "project": "p", "model": "claude", "date": "2026-05-10"}
-        self.assertEqual(m.daily_input_tokens.labels(**labels)._value.get(), 200)
-        self.assertEqual(m.daily_cost_usd.labels(**labels)._value.get(), 0.1)
+        })
+        m.record_usage("cc", {
+            "model": "claude", "project": "p",
+            "input_tokens": 50, "output_tokens": 0,
+            "cache_creation_tokens": 0, "cache_read_tokens": 0,
+            "cost_usd": 0.02, "timestamp": datetime(2026, 5, 10),
+        })
+
+        saved = m.snapshot_state()["daily"]
+
+        self.assertEqual([entry["key"] for entry in saved], [key])
+        self.assertEqual(saved[0]["values"]["input"], 250)
+        self.assertAlmostEqual(saved[0]["values"]["cost"], 0.12)
+        exposition = generate_latest(REGISTRY).decode()
+        self.assertIn("codeagent_input_tokens_total", exposition)
+        self.assertNotIn("codeagent_daily", exposition)
 
     def test_restore_skips_malformed_entries(self):
         m = _fresh_metrics()

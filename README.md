@@ -21,7 +21,6 @@ Import `grafana/dashboards/token-stats.json` or use the included provisioning. T
 - Tracks cost in USD
 - Supports multiple agents: Claude Code, AntCC (CodeFuse), Codex, CodeFuse Codex
 - Configurable source label for multi-machine setups
-- Daily token gauges for historical queries
 - Persists watcher state to avoid double-counting JSONL history after restarts
 - Grafana dashboard included
 
@@ -147,11 +146,6 @@ separate from the collector's basename rule.
 | `codeagent_cache_creation_tokens_total` | Counter | source, agent, project, model |
 | `codeagent_cache_read_tokens_total` | Counter | source, agent, project, model |
 | `codeagent_cost_usd_total` | Counter | source, agent, project, model |
-| `codeagent_daily_input_tokens` | Gauge | source, agent, project, model, date |
-| `codeagent_daily_output_tokens` | Gauge | source, agent, project, model, date |
-| `codeagent_daily_cache_creation_tokens` | Gauge | source, agent, project, model, date |
-| `codeagent_daily_cache_read_tokens` | Gauge | source, agent, project, model, date |
-| `codeagent_daily_cost_usd` | Gauge | source, agent, project, model, date |
 
 ## Docker Compose
 
