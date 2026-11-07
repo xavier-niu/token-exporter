@@ -17,6 +17,12 @@ def project_dir(root, cwd, key=None):
     return path
 
 
+def log_activity(project):
+    """Append to a session; collectors only rescan when a root's files change."""
+    with (project / 'session.jsonl').open('a') as session:
+        session.write('{}\n')
+
+
 def daily(tokens, cost=0):
     return [{'date': datetime.now(timezone.utc).date().isoformat(), 'modelBreakdowns': [{
         'modelName': 'fixture', 'inputTokens': tokens, 'outputTokens': 0,
@@ -117,11 +123,13 @@ def test_multiple_checkouts_and_config_roots_are_summed_before_deltas(tmp_path):
         restored.scan_history()
         assert len(records) == 1
         data[str(second)]['projects'][c.name] = daily(325, .325)
+        log_activity(c)
         restored.check_updates()
         restored.check_updates()
         assert [record['input_tokens'] for record in records] == [600, 25]
         assert records[1]['cost_usd'] == pytest.approx(.025)
         # A failed root must not lower the total and replay usage on recovery.
+        log_activity(c)
         with patch('watcher._run_ccusage', side_effect=lambda root, *_: data[root] if root == str(first) else None):
             restored.check_updates()
         restored.check_updates()

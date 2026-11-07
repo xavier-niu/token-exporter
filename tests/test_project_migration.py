@@ -7,7 +7,7 @@ import pytest
 
 import app
 import migrate_project_names as migration
-from tests.test_projects import daily, project_dir
+from tests.test_projects import daily, log_activity, project_dir
 from tests.test_metrics_state import _fresh_metrics
 from watcher import CcusageCollector, _load_last_totals
 
@@ -66,6 +66,7 @@ def test_migration_preserves_totals_backups_deltas_and_restart(tmp_path):
         collector.check_updates()
         assert metrics.snapshot_state()['cumulative'][0]['values']['input'] == 300
         data['projects'][a.name] = daily(125, .125)
+        log_activity(a)
         collector.scan_history()
         collector.check_updates()
         assert metrics.snapshot_state()['cumulative'][0]['values']['input'] == 325

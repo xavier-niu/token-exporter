@@ -236,18 +236,66 @@ _CODEX_TOTAL_FIELDS = (
 
 @dataclass
 class _CodexFileCacheEntry:
-    signature: tuple[int, int, int, int]
+    signature: tuple[int, int, int, int, int]
     since: str
     totals: dict
 
 
-def _codex_file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+def _file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         stat_result.st_dev,
         stat_result.st_ino,
         stat_result.st_size,
         stat_result.st_mtime_ns,
+        # A chmod that makes a session readable changes only this.
+        stat_result.st_ctime_ns,
     )
+
+
+def _is_scan_input(filename: str) -> bool:
+    """Session logs, plus the index ClaudeProjectResolver prefers over them."""
+    return filename.endswith(".jsonl") or filename == "sessions-index.json"
+
+
+def _tree_signature(root: str) -> dict[str, tuple | None] | None:
+    """Fingerprint every file a scan of `root` could read, without opening any.
+
+    Symlinks are followed because the in-process parsers follow them (ccusage
+    ignores them, so this is a superset). A path that can't be inspected is
+    recorded as None, so it reads as a change once it can be. An unreadable
+    `root` returns None, which must never be treated as unchanged.
+    """
+    signature: dict[str, tuple | None] = {}
+    visited_dirs: set[tuple[int, int]] = set()
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir():
+                            stat_result = entry.stat()
+                            dir_id = (stat_result.st_dev, stat_result.st_ino)
+                            if dir_id not in visited_dirs:
+                                visited_dirs.add(dir_id)
+                                pending.append(entry.path)
+                        elif _is_scan_input(entry.name):
+                            signature[entry.path] = _file_signature(entry.stat())
+                    except OSError:
+                        signature[entry.path] = None
+        except OSError:
+            if directory == root:
+                return None
+            signature[directory] = None
+    return signature
+
+
+@dataclass
+class _RootScan:
+    signature: dict[str, tuple | None]
+    inputs: tuple
+    data: dict
 
 
 def _prune_codex_totals(totals: dict, since_local: str) -> None:
@@ -369,7 +417,7 @@ def _scan_antcodex_dir(
         seen.add(cache_key)
         cached = file_cache.get(cache_key)
         try:
-            signature = _codex_file_signature(session_file.stat())
+            signature = _file_signature(session_file.stat())
         except OSError:
             if cached:
                 if cached.since < since_local:
@@ -593,6 +641,7 @@ class _BaseCollector:
         self.timezone_name = timezone_name
         self.pricing_rates = pricing_rates or {}
         self._last_totals: dict[tuple, dict[str, float]] = {}
+        self._root_scans: dict[str, _RootScan] = {}
         if state_file:
             self._last_totals = _load_last_totals(state_file)
             logger.info("Loaded %s state from %s (%d entries)",
@@ -604,10 +653,40 @@ class _BaseCollector:
         _prune_stale_totals(self._last_totals, since)
         return since
 
+    def _scan_root(self, root, tree, inputs, scan):
+        """Return scan()'s result for a data root, rerunning it only when needed.
+
+        This is what keeps an idle exporter idle: a poll costs a stat of each file
+        under `tree` unless one of them, or `inputs` (whatever else the result
+        depends on), has changed. The result must not be reused across a change of
+        scan window, or days whose cursor was pruned would be emitted again.
+
+        A scan that returns None is not cached, so it is retried on the next poll.
+        A file that fails to read mid-scan without failing the whole scan is
+        retried once it changes, or at the next daily window change.
+        """
+        # Fingerprint first: a write racing the scan then reads as a change next poll.
+        signature = _tree_signature(tree)
+        previous = self._root_scans.get(root)
+        if (
+            previous
+            and signature is not None
+            and previous.signature == signature
+            and previous.inputs == inputs
+        ):
+            return previous.data
+        data = scan()
+        if data is not None and signature is not None:
+            self._root_scans[root] = _RootScan(signature, inputs, data)
+        return data
+
     def _finish_scan(self, persist, total_records):
         if persist and self.state_file:
             _save_last_totals(self.state_file, self._last_totals)
-        logger.info("%s: emitted %d records", type(self).__name__, total_records)
+        logger.log(
+            logging.INFO if total_records else logging.DEBUG,
+            "%s: emitted %d records", type(self).__name__, total_records,
+        )
 
     def scan_history(self, persist=True):
         """Scan all configured directories and emit records.
@@ -653,6 +732,26 @@ class CcusageCollector(_BaseCollector):
                          timezone_name, pricing_rates)
         self.project_resolver = ClaudeProjectResolver()
 
+    def _scan_claude_root(self, claude_dir, agent, since):
+        """Scan one root and key its result by project name; None if the scan failed.
+
+        Names are resolved here so that a cached result also spares re-reading the
+        logs of a project whose cwd is unknown. Everything the resolver reads is
+        part of the root's signature, so it is retried as soon as that can help.
+        """
+        if agent == "antcc":
+            data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
+        else:
+            data = _run_ccusage(claude_dir, since, self.timezone_name)
+            if data is None:
+                return None
+        projects = {}
+        for key, entries in data.get("projects", {}).items():
+            name = self.project_resolver.resolve(claude_dir, key)
+            if name is not None:
+                projects.setdefault(name, []).extend(entries)
+        return {"projects": projects}
+
     def scan_history(self, persist=True):
         since = self._scan_since()
         total_records = 0
@@ -661,22 +760,20 @@ class CcusageCollector(_BaseCollector):
         for claude_dir in dict.fromkeys(self.dirs):
             if not os.path.isdir(claude_dir):
                 continue
-            if not os.path.isdir(os.path.join(claude_dir, "projects")):
+            projects_dir = os.path.join(claude_dir, "projects")
+            if not os.path.isdir(projects_dir):
                 logger.debug("Skipping %s: no projects/ directory", claude_dir)
                 continue
             agent = _detect_agent(claude_dir)
-            if agent == "antcc":
-                data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
-            else:
-                data = _run_ccusage(claude_dir, since, self.timezone_name)
-                if data is None:
-                    failed_agents.add(agent)
-                    continue
+            data = self._scan_root(
+                claude_dir, projects_dir, (since,),
+                lambda: self._scan_claude_root(claude_dir, agent, since),
+            )
+            if data is None:
+                failed_agents.add(agent)
+                continue
             projects = collected.setdefault(agent, {"projects": {}})["projects"]
-            for key, entries in data.get("projects", {}).items():
-                name = self.project_resolver.resolve(claude_dir, key)
-                if name is None:
-                    continue
+            for name, entries in data["projects"].items():
                 projects.setdefault(name, []).extend(entries)
         for agent, data in collected.items():
             if agent in failed_agents:
@@ -707,18 +804,22 @@ class CodexCollector(_BaseCollector):
         for codex_dir in dict.fromkeys(self.dirs):
             if not os.path.isdir(codex_dir):
                 continue
-            if not os.path.isdir(os.path.join(codex_dir, "sessions")):
+            sessions_dir = os.path.join(codex_dir, "sessions")
+            if not os.path.isdir(sessions_dir):
                 logger.debug("Skipping %s: no sessions/ directory", codex_dir)
                 continue
             agent = _detect_agent(codex_dir)
             cache_key = os.path.abspath(codex_dir)
             file_cache = self._file_caches.setdefault(cache_key, {})
-            data = _scan_antcodex_dir(
-                codex_dir,
-                since,
-                self.timezone_name,
-                self.pricing_rates,
-                file_cache=file_cache,
+            data = self._scan_root(
+                codex_dir, sessions_dir, (since, self.pricing_rates),
+                lambda: _scan_antcodex_dir(
+                    codex_dir,
+                    since,
+                    self.timezone_name,
+                    self.pricing_rates,
+                    file_cache=file_cache,
+                ),
             )
             projects = collected.setdefault(agent, {"projects": {}})["projects"]
             for name, entries in data["projects"].items():

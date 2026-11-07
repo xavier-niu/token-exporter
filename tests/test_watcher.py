@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+import projects
 import watcher
 from watcher import CcusageCollector, CodexCollector
 
@@ -849,3 +851,343 @@ class TestAntcodexFixture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _claude_root(tmp_path, name, cwd="/work/demo"):
+    """A real .claude root with one session; ccusage itself is mocked per test."""
+    project = tmp_path / name / ".claude" / "projects" / cwd.replace("/", "-")
+    project.mkdir(parents=True)
+    session = project / "session.jsonl"
+    session.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n")
+    return str(project.parents[1]), session
+
+
+def _append(path, text='{"type": "user"}\n'):
+    with path.open("a") as f:
+        f.write(text)
+
+
+def _ccusage_report(project_key, tokens):
+    return {"projects": {project_key: [{
+        "date": _DAY1_STR,
+        "modelBreakdowns": [{"modelName": "m", "inputTokens": tokens, "cost": 0}],
+    }]}}
+
+
+def _antcc_line(msg_id, tokens, day=_DAY1):
+    return json.dumps({
+        "type": "assistant",
+        "cwd": "/work/demo",
+        "timestamp": f"{day.isoformat()}T12:00:00.000Z",
+        "message": {"id": msg_id, "model": "m", "usage": {"input_tokens": tokens}},
+    }) + "\n"
+
+
+class TestUnchangedRootsAreNotRescanned:
+    """An idle poll must cost a stat per file and never under- or over-count."""
+
+    KEY = "-work-demo"
+
+    def _collector(self, *roots, **kwargs):
+        records = []
+        collector = CcusageCollector(
+            claude_dirs=list(roots),
+            on_record=lambda _, record: records.append(record),
+            **kwargs,
+        )
+        return collector, records
+
+    def test_unchanged_root_does_not_rerun_ccusage(self, tmp_path):
+        root, _ = _claude_root(tmp_path, "a")
+        collector, records = self._collector(root)
+        report = _ccusage_report(self.KEY, 100)
+        with patch("watcher._run_ccusage", return_value=report) as run:
+            for _ in range(3):
+                collector.check_updates()
+        assert run.call_count == 1
+        assert [r["input_tokens"] for r in records] == [100]
+
+    @pytest.mark.parametrize("change", ["append", "new_session", "subagent", "delete", "index"])
+    def test_any_scan_input_changing_reruns_ccusage(self, tmp_path, change):
+        root, session = _claude_root(tmp_path, "a")
+        (session.parent / "other.jsonl").write_text("{}\n")
+        collector, _ = self._collector(root)
+        with patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 100)) as run:
+            collector.check_updates()
+            if change == "append":
+                _append(session)
+            elif change == "new_session":
+                (session.parent / "new.jsonl").write_text("{}\n")
+            elif change == "subagent":
+                nested = session.parent / "abc" / "subagents"
+                nested.mkdir(parents=True)
+                (nested / "agent.jsonl").write_text("{}\n")
+            elif change == "delete":
+                (session.parent / "other.jsonl").unlink()
+            elif change == "index":
+                (session.parent / "sessions-index.json").write_text("{}")
+            collector.check_updates()
+        assert run.call_count == 2
+
+    def test_files_no_scan_reads_do_not_rerun_ccusage(self, tmp_path):
+        root, session = _claude_root(tmp_path, "a")
+        collector, _ = self._collector(root)
+        with patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 100)) as run:
+            collector.check_updates()
+            (session.parent / "memory").mkdir()
+            (session.parent / "memory" / "MEMORY.md").write_text("note")
+            (session.parent / "output.txt").write_text("tool result")
+            collector.check_updates()
+        assert run.call_count == 1
+
+    def test_only_the_changed_root_is_rescanned_and_totals_stay_summed(self, tmp_path):
+        first, _ = _claude_root(tmp_path, "one")
+        second, second_session = _claude_root(tmp_path, "two")
+        collector, records = self._collector(first, second)
+        reports = {
+            first: _ccusage_report(self.KEY, 100),
+            second: _ccusage_report(self.KEY, 200),
+        }
+        with patch("watcher._run_ccusage", side_effect=lambda root, *_: reports[root]) as run:
+            collector.check_updates()
+            run.reset_mock()
+            reports[second] = _ccusage_report(self.KEY, 250)
+            _append(second_session)
+            collector.check_updates()
+        assert [call.args[0] for call in run.call_args_list] == [second]
+        # 300 is both roots summed; dropping the cached root would stall the cursor.
+        assert [r["input_tokens"] for r in records] == [300, 50]
+
+    def test_failed_scan_is_retried_even_though_files_did_not_change(self, tmp_path):
+        root, _ = _claude_root(tmp_path, "a")
+        collector, records = self._collector(root)
+        with patch("watcher._run_ccusage", side_effect=[None, _ccusage_report(self.KEY, 100)]) as run:
+            collector.check_updates()
+            assert records == []
+            collector.check_updates()
+            collector.check_updates()
+        assert run.call_count == 2
+        assert [r["input_tokens"] for r in records] == [100]
+
+    def test_failed_root_holds_back_its_agent_until_retry_succeeds(self, tmp_path):
+        first, _ = _claude_root(tmp_path, "one")
+        second, _ = _claude_root(tmp_path, "two")
+        collector, records = self._collector(first, second)
+        good = {first: _ccusage_report(self.KEY, 100), second: _ccusage_report(self.KEY, 200)}
+        failing = {first: good[first], second: None}
+        with patch("watcher._run_ccusage", side_effect=lambda root, *_: failing[root]):
+            collector.check_updates()
+        assert records == []
+        with patch("watcher._run_ccusage", side_effect=lambda root, *_: good[root]) as run:
+            collector.check_updates()
+            collector.check_updates()
+        # The healthy root is served from its cache; the failed one is rescanned once.
+        assert [call.args[0] for call in run.call_args_list] == [second]
+        assert [r["input_tokens"] for r in records] == [300]
+
+    def test_write_during_a_scan_is_picked_up_on_the_next_poll(self, tmp_path):
+        root, session = _claude_root(tmp_path, "a")
+        collector, records = self._collector(root)
+
+        def racing_scan(*_):
+            report = _ccusage_report(self.KEY, 100)
+            _append(session)  # Lands after ccusage read the file.
+            return report
+
+        with patch("watcher._run_ccusage", side_effect=racing_scan):
+            collector.check_updates()
+        with patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 150)) as run:
+            collector.check_updates()
+        assert run.call_count == 1
+        assert [r["input_tokens"] for r in records] == [100, 50]
+
+    def test_window_change_rescans_without_replaying_days_that_left_it(self, tmp_path):
+        root = tmp_path / ".codefuse" / "engine" / "cc"
+        session = root / "projects" / "-work-demo" / "session.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(_antcc_line("old", 100, _DAY1))
+        collector, records = self._collector(str(root), days_back=7)
+        start = datetime.combine(_DAY1, datetime.min.time(), timezone.utc)
+        with patch("watcher._utcnow", return_value=start):
+            collector.check_updates()
+        assert [r["input_tokens"] for r in records] == [100]
+        # _DAY1's cursor gets pruned now, so reusing the cached scan would re-emit it.
+        with patch("watcher._utcnow", return_value=start + timedelta(days=8)):
+            collector.check_updates()
+            collector.check_updates()
+        assert [r["input_tokens"] for r in records] == [100]
+
+    def test_unchanged_antcc_root_is_not_reparsed_and_append_counts_once(self, tmp_path):
+        root = tmp_path / ".codefuse" / "engine" / "cc"
+        session = root / "projects" / "-work-demo" / "session.jsonl"
+        session.parent.mkdir(parents=True)
+        session.write_text(_antcc_line("one", 100))
+        collector, records = self._collector(str(root))
+        with patch("watcher._scan_antcc_dir", wraps=watcher._scan_antcc_dir) as scan:
+            collector.check_updates()
+            collector.check_updates()
+            assert scan.call_count == 1
+            _append(session, _antcc_line("two", 40))
+            collector.check_updates()
+            collector.check_updates()
+            assert scan.call_count == 2
+        assert [r["input_tokens"] for r in records] == [100, 40]
+
+    def test_unresolved_project_is_not_reread_until_its_metadata_changes(self, tmp_path):
+        root = tmp_path / ".claude"
+        project = root / "projects" / self.KEY
+        project.mkdir(parents=True)
+        (project / "session.jsonl").write_text('{"type": "no-cwd-here"}\n')
+        collector, records = self._collector(str(root))
+        with (
+            patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 100)),
+            patch("projects._project_cwd", wraps=projects._project_cwd) as read_cwd,
+        ):
+            collector.check_updates()
+            collector.check_updates()
+            assert read_cwd.call_count == 1
+            assert records == []
+            (project / "sessions-index.json").write_text(json.dumps({"originalPath": "/work/demo"}))
+            collector.check_updates()
+        assert [(r["project"], r["input_tokens"]) for r in records] == [("demo", 100)]
+
+    def test_restart_rescans_once_and_does_not_double_count(self, tmp_path):
+        root, _ = _claude_root(tmp_path, "a")
+        state = str(tmp_path / "state.json")
+        report = _ccusage_report(self.KEY, 100)
+        collector, records = self._collector(root, state_file=state)
+        with patch("watcher._run_ccusage", return_value=report):
+            collector.scan_history()
+        restarted, new_records = self._collector(root, state_file=state)
+        with patch("watcher._run_ccusage", return_value=report) as run:
+            restarted.scan_history()
+            restarted.scan_history()
+        assert run.call_count == 1
+        assert [r["input_tokens"] for r in records] == [100]
+        assert new_records == []
+
+    def test_idle_poll_logs_nothing_at_info(self, tmp_path, caplog):
+        root, _ = _claude_root(tmp_path, "a")
+        collector, _ = self._collector(root)
+        with (
+            patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 100)),
+            caplog.at_level("INFO", logger="token-stats"),
+        ):
+            collector.check_updates()
+            assert "emitted 1 records" in caplog.text
+            caplog.clear()
+            collector.check_updates()
+        assert caplog.text == ""
+
+
+class TestUnchangedCodexRootsAreNotRescanned:
+    def _collector(self, tmp_path, **kwargs):
+        codex_dir = tmp_path / ".codex"
+        session = codex_dir / "sessions" / "rollout.jsonl"
+        _write_codex_session(session, _codex_session_rows(_DAY1, [(1000, 400, 50)]))
+        records = []
+        collector = CodexCollector(
+            codex_dirs=[str(codex_dir)],
+            on_record=lambda _, record: records.append(record),
+            **kwargs,
+        )
+        return collector, records, session
+
+    def test_unchanged_root_skips_the_scan(self, tmp_path):
+        collector, records, _ = self._collector(tmp_path)
+        with patch("watcher._scan_antcodex_dir", wraps=watcher._scan_antcodex_dir) as scan:
+            for _ in range(3):
+                collector.check_updates()
+        assert scan.call_count == 1
+        assert len(records) == 1
+
+    def test_append_rescans_and_counts_once(self, tmp_path):
+        collector, records, session = self._collector(tmp_path)
+        collector.check_updates()
+        _write_codex_session(session, _codex_session_rows(_DAY1, [(1000, 400, 50), (1500, 400, 80)]))
+        collector.check_updates()
+        collector.check_updates()
+        assert len(records) == 2
+        assert records[1]["output_tokens"] == 30
+
+    def test_pricing_reload_refreshes_the_cost_cursor(self, tmp_path):
+        rates = {"gpt-5": {"input": 0.01, "cached": 0.001, "output": 0.02}}
+        collector, records, _ = self._collector(tmp_path, pricing_rates=rates)
+        collector.check_updates()
+        cursor_key = next(iter(collector._last_totals))
+        cost_before = collector._last_totals[cursor_key]["cost_usd"]
+        assert cost_before > 0
+        with patch("watcher._scan_antcodex_dir", wraps=watcher._scan_antcodex_dir) as scan:
+            collector.check_updates()
+            assert scan.call_count == 0
+            # An equal table must not cost a rescan, and a changed one must.
+            collector.pricing_rates = {model: dict(rate) for model, rate in rates.items()}
+            collector.check_updates()
+            assert scan.call_count == 0
+            collector.pricing_rates = {"gpt-5": {"input": 0.1, "cached": 0.01, "output": 0.2}}
+            collector.check_updates()
+            assert scan.call_count == 1
+        assert collector._last_totals[cursor_key]["cost_usd"] == pytest.approx(cost_before * 10)
+        assert len(records) == 1  # Repricing alone is not new usage.
+
+
+class TestTreeSignature:
+    def test_missing_root_is_never_unchanged(self, tmp_path):
+        assert watcher._tree_signature(str(tmp_path / "missing")) is None
+
+    def test_only_scan_inputs_are_fingerprinted(self, tmp_path):
+        (tmp_path / "a.jsonl").write_text("{}\n")
+        (tmp_path / "sessions-index.json").write_text("{}")
+        (tmp_path / "notes.md").write_text("x")
+        (tmp_path / "b.json").write_text("{}")
+        assert set(watcher._tree_signature(str(tmp_path))) == {
+            str(tmp_path / "a.jsonl"),
+            str(tmp_path / "sessions-index.json"),
+        }
+
+    def test_symlinks_are_followed_and_cycles_terminate(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "linked.jsonl"
+        target.write_text("{}\n")
+        root = tmp_path / "root"
+        (root / "real").mkdir(parents=True)
+        (root / "dir-link").symlink_to(outside)
+        (root / "real" / "file-link.jsonl").symlink_to(target)
+        (root / "real" / "loop").symlink_to(root)
+        (root / "real" / "broken.jsonl").symlink_to(tmp_path / "gone")
+
+        before = watcher._tree_signature(str(root))
+
+        # Exactly these: the loop back to root must not revisit anything.
+        assert set(before) == {
+            str(root / "dir-link" / "linked.jsonl"),
+            str(root / "real" / "file-link.jsonl"),
+            str(root / "real" / "broken.jsonl"),
+        }
+        assert before[str(root / "real" / "file-link.jsonl")] is not None
+        assert before[str(root / "real" / "broken.jsonl")] is None
+        _append(target)
+        after = watcher._tree_signature(str(root))
+        assert after[str(root / "dir-link" / "linked.jsonl")] != before[str(root / "dir-link" / "linked.jsonl")]
+
+    def test_chmod_counts_as_a_change(self, tmp_path):
+        session = tmp_path / "s.jsonl"
+        session.write_text("{}\n")
+        before = watcher._tree_signature(str(tmp_path))
+        time.sleep(0.02)  # st_ctime has coarser resolution than the call is long.
+        session.chmod(0o600)
+        assert watcher._tree_signature(str(tmp_path)) != before
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+    def test_unreadable_subdirectory_is_recorded_and_clearing_it_is_a_change(self, tmp_path):
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        (locked / "s.jsonl").write_text("{}\n")
+        locked.chmod(0)
+        try:
+            blocked = watcher._tree_signature(str(tmp_path))
+            assert blocked == {str(locked): None}
+        finally:
+            locked.chmod(0o700)
+        assert watcher._tree_signature(str(tmp_path)) != blocked

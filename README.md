@@ -49,7 +49,7 @@ docker run -d \
 | Env Var | Default | Description |
 |---|---|---|
 | `LISTEN_PORT` | `14531` | Prometheus metrics port |
-| `WATCH_INTERVAL` | `60` | Seconds between rescans (how fresh the exposed metrics are) |
+| `WATCH_INTERVAL` | `60` | Seconds between checks for changed session files (how fresh the exposed metrics are). A root with no changed files costs only a `stat` per file; `ccusage` and the JSONL parsers run only for roots that changed, and once a day when the scan window moves |
 | `PERSIST_INTERVAL` | `600` | Seconds between state-file flushes; a crash re-emits at most this much usage on restart (idempotent, no double count) |
 | `CLAUDE_CONFIG_DIR` | `~/.claude,~/.codefuse/engine/cc` | Comma-separated Claude Code/AntCC config directories using `projects/` subdirs |
 | `CODEX_CONFIG_DIR` | `~/.codex,~/.codefuse/engine/codex` | Comma-separated Codex/CodeFuse Codex config directories using `sessions/` subdirs |
