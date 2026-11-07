@@ -201,6 +201,10 @@ def _merge_state_with_bootstrap(state: dict, bootstrap: dict) -> dict:
     Collector offsets are written before the metrics counter snapshot. If the
     process dies between those writes, the next startup can recover by taking
     the max of the saved counter snapshot and the collector totals.
+
+    Only tokens can show that usage was lost. A cc offset holds ccusage's own
+    cost while the counters use the shared pricing map, so the two differ with
+    nothing lost, and flooring on cost alone would add phantom spend on restart.
     """
     merged = {"schema_version": 1, "cumulative": [], "daily": []}
     for section in ("cumulative", "daily"):
@@ -219,8 +223,14 @@ def _merge_state_with_bootstrap(state: dict, bootstrap: dict) -> dict:
             if not key:
                 continue
             row = rows.setdefault(key, {})
-            for field, value in entry.get("values", {}).items():
-                row[field] = max(float(row.get(field, 0) or 0), float(value or 0))
+            values = entry.get("values", {})
+            lost_usage = any(
+                float(values.get(field, 0) or 0) > float(row.get(field, 0) or 0)
+                for field in ("input", "output", "cache_creation", "cache_read")
+            )
+            for field, value in values.items():
+                if field != "cost" or lost_usage:
+                    row[field] = max(float(row.get(field, 0) or 0), float(value or 0))
 
         merged[section] = [
             {"key": list(key), "values": values}
