@@ -297,3 +297,90 @@ class TestClaudeFixtureGroundTruth:
             ) / 1_000_000
             assert rec["cost_usd"] == pytest.approx(expected)
             assert rec["cost_usd"] > 0
+
+
+def _ccusage_log_line(message_id: str, tokens: int, session: str = "s") -> str:
+    # Compact like real Claude Code logs: ccusage skips lines with spaced JSON.
+    return json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-05-25T12:00:00.000Z",
+        "sessionId": session,
+        "requestId": f"req-{message_id}",
+        "cwd": "/work/demo",
+        "version": "1.0.0",
+        "message": {
+            "id": message_id,
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "content": [],
+            "usage": {"input_tokens": tokens, "output_tokens": 0},
+        },
+    }, separators=(",", ":")) + "\n"
+
+
+def _write_log(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _input_tokens(report: dict) -> int:
+    return sum(
+        entry["inputTokens"]
+        for entries in report.get("projects", {}).values()
+        for entry in entries
+    )
+
+
+@skip_unless_ccusage
+class TestCcusageContract:
+    """What the exporter assumes about the ccusage CLI; rerun these on every bump."""
+
+    SINCE = datetime(2020, 1, 1).date()
+
+    def test_reads_nothing_outside_the_root_signature(self, tmp_path):
+        # The scan cache trusts _tree_signature to cover all of ccusage's inputs,
+        # so a file it reads beyond that could change results without a rescan.
+        root = tmp_path / ".claude"
+        for tokens, name in {
+            1: "projects/-a/s.jsonl",
+            2: "projects/-a/abc/subagents/agent.jsonl",
+            4: "s.jsonl",
+            8: "other/s.jsonl",
+            16: "transcripts/s.jsonl",
+            32: "projects/-a/s.json",
+            64: "projects/-a/s.JSONL",
+            128: "projects/-a/s.jsonl.bak",
+        }.items():
+            _write_log(root / name, _ccusage_log_line(f"m{tokens}", tokens))
+
+        report = watcher._run_ccusage(str(root), self.SINCE, "UTC")
+
+        assert _input_tokens(report) == 1 + 2
+
+    def test_a_run_does_not_change_the_root_signature(self, tmp_path):
+        root = tmp_path / ".claude"
+        _write_log(root / "projects/-a/s.jsonl", _ccusage_log_line("m", 1))
+        before = watcher._tree_signature(str(root / "projects"))
+
+        assert watcher._run_ccusage(str(root), self.SINCE, "UTC") is not None
+
+        assert watcher._tree_signature(str(root / "projects")) == before
+
+    def test_root_without_usage_is_not_a_failed_scan(self, tmp_path):
+        root = tmp_path / ".claude"
+        (root / "projects/-a").mkdir(parents=True)
+
+        report = watcher._run_ccusage(str(root), self.SINCE, "UTC")
+
+        assert report is not None
+        assert _input_tokens(report) == 0
+
+    def test_request_repeated_across_sessions_is_counted_once(self, tmp_path):
+        # Claude Code copies earlier requests into a resumed session's log.
+        root = tmp_path / ".claude"
+        _write_log(root / "projects/-a/one.jsonl", _ccusage_log_line("m", 100, session="one"))
+        _write_log(root / "projects/-a/two.jsonl", _ccusage_log_line("m", 100, session="two"))
+
+        report = watcher._run_ccusage(str(root), self.SINCE, "UTC")
+
+        assert _input_tokens(report) == 100
