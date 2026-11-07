@@ -2,7 +2,7 @@ import json
 import logging
 from collections import defaultdict
 
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter
 
 from projects import PROJECT_NAME_FORMAT, check_project_name_format
 from state_io import atomic_write_json
@@ -10,19 +10,12 @@ from state_io import atomic_write_json
 logger = logging.getLogger("token-stats")
 
 LABELS = ["source", "agent", "project", "model"]
-DAILY_LABELS = ["source", "agent", "project", "model", "date"]
 
 input_tokens_total = Counter("codeagent_input_tokens_total", "Total input tokens", LABELS)
 output_tokens_total = Counter("codeagent_output_tokens_total", "Total output tokens", LABELS)
 cache_creation_tokens_total = Counter("codeagent_cache_creation_tokens_total", "Total cache creation tokens", LABELS)
 cache_read_tokens_total = Counter("codeagent_cache_read_tokens_total", "Total cache read tokens", LABELS)
 cost_usd_total = Counter("codeagent_cost_usd_total", "Total cost in USD", LABELS)
-
-daily_input_tokens = Gauge("codeagent_daily_input_tokens", "Daily input tokens", DAILY_LABELS)
-daily_output_tokens = Gauge("codeagent_daily_output_tokens", "Daily output tokens", DAILY_LABELS)
-daily_cache_creation_tokens = Gauge("codeagent_daily_cache_creation_tokens", "Daily cache creation tokens", DAILY_LABELS)
-daily_cache_read_tokens = Gauge("codeagent_daily_cache_read_tokens", "Daily cache read tokens", DAILY_LABELS)
-daily_cost_usd = Gauge("codeagent_daily_cost_usd", "Daily cost USD", DAILY_LABELS)
 
 _FIELDS = ("input", "output", "cache_creation", "cache_read", "cost")
 
@@ -32,6 +25,7 @@ def _zero_values() -> dict[str, float]:
 
 
 _cumulative_totals: dict[tuple, dict[str, float]] = defaultdict(_zero_values)
+# Saved but not exported: a rollback to a version with daily gauges restores them.
 _daily_data: dict[tuple, dict[str, float]] = defaultdict(_zero_values)
 
 _source: str = ""
@@ -53,14 +47,6 @@ def _apply_counters(src: str, agent: str, project: str, model: str, values: dict
         cache_read_tokens_total.labels(source=src, agent=agent, project=project, model=model).inc(values["cache_read"])
     if values.get("cost", 0) > 0:
         cost_usd_total.labels(source=src, agent=agent, project=project, model=model).inc(values["cost"])
-
-
-def _apply_daily(src: str, agent: str, project: str, model: str, date_str: str, values: dict[str, float]) -> None:
-    daily_input_tokens.labels(source=src, agent=agent, project=project, model=model, date=date_str).set(values.get("input", 0))
-    daily_output_tokens.labels(source=src, agent=agent, project=project, model=model, date=date_str).set(values.get("output", 0))
-    daily_cache_creation_tokens.labels(source=src, agent=agent, project=project, model=model, date=date_str).set(values.get("cache_creation", 0))
-    daily_cache_read_tokens.labels(source=src, agent=agent, project=project, model=model, date=date_str).set(values.get("cache_read", 0))
-    daily_cost_usd.labels(source=src, agent=agent, project=project, model=model, date=date_str).set(values.get("cost", 0))
 
 
 def record_usage(agent: str, rec: dict):
@@ -89,7 +75,6 @@ def record_usage(agent: str, rec: dict):
     d = _daily_data[d_key]
     for f in _FIELDS:
         d[f] += delta[f]
-    _apply_daily(src, agent, project, model, date_str, d)
 
 
 def snapshot_state() -> dict:
@@ -102,7 +87,7 @@ def snapshot_state() -> dict:
 
 
 def restore_state(state: dict) -> None:
-    """Seed counters/gauges and in-memory accumulators from a saved snapshot.
+    """Seed counters and in-memory accumulators from a saved snapshot.
 
     Must be called BEFORE the HTTP server starts and before any record_usage
     call, otherwise restored values are added on top of fresh deltas.
@@ -124,9 +109,7 @@ def restore_state(state: dict) -> None:
         key = tuple(entry.get("key", []))
         if len(key) != 5:
             continue
-        src, agent, project, model, date_str = key
         values = entry.get("values", {})
-        _apply_daily(src, agent, project, model, date_str, values)
         _daily_data[key] = {f: float(values.get(f, 0)) for f in _FIELDS}
         restored_daily += 1
     logger.info("Restored %d counter series and %d daily series", restored_counters, restored_daily)
