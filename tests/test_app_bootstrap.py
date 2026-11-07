@@ -174,6 +174,29 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def _merged_row(counter: dict, offset: dict) -> dict:
+    key = ["host", "cc", "p", "m"]
+    state = {"cumulative": [{"key": key, "values": counter}], "daily": []}
+    bootstrap = {"cumulative": [{"key": key, "values": offset}], "daily": []}
+    return app._merge_state_with_bootstrap(state, bootstrap)["cumulative"][0]["values"]
+
+
+def test_offset_cost_alone_does_not_raise_a_counter_that_lost_nothing():
+    # ccusage prices the same tokens differently from the shared pricing map.
+    tokens = {"input": 100, "output": 10, "cache_creation": 5, "cache_read": 50}
+    merged = _merged_row({**tokens, "cost": 1.0}, {**tokens, "cost": 1.2})
+    assert merged["cost"] == 1.0
+    assert merged["input"] == 100
+
+
+def test_offset_cost_is_recovered_when_any_token_field_lags():
+    counter = {"input": 100, "output": 10, "cache_creation": 5, "cache_read": 50, "cost": 1.0}
+    offset = {**counter, "cache_read": 60, "cost": 1.2}
+    merged = _merged_row(counter, offset)
+    assert merged["cost"] == 1.2
+    assert merged["cache_read"] == 60
+
+
 def test_idle_servers_do_not_wake_up_to_poll():
     server = MagicMock()
     app._serve_in_background(server).join(timeout=5)
