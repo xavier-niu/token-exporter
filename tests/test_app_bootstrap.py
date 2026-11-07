@@ -7,7 +7,9 @@ the existing per-collector last_totals files so historic totals are not lost.
 import json
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import app
 
@@ -170,3 +172,20 @@ class TestBootstrap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_idle_servers_do_not_wake_up_to_poll():
+    server = MagicMock()
+    app._serve_in_background(server).join(timeout=5)
+    server.serve_forever.assert_called_once_with(poll_interval=app.SERVER_IDLE_POLL_SECS)
+    assert app.SERVER_IDLE_POLL_SECS >= 3600
+
+
+def test_metrics_server_answers_immediately_despite_the_long_idle_poll():
+    # Left running: shutdown() would block for the poll interval, and the daemon
+    # thread ends with the test process.
+    server = app._start_metrics_server(0)
+    url = f"http://127.0.0.1:{server.server_port}/metrics"
+    with urllib.request.urlopen(url, timeout=5) as response:
+        assert response.status == 200
+        assert b"# TYPE" in response.read()

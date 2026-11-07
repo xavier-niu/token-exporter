@@ -6,8 +6,10 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
-from prometheus_client import start_http_server
+from prometheus_client import make_wsgi_app
+from prometheus_client.exposition import ThreadingWSGIServer
 
 import pricing
 from config import load_config
@@ -16,6 +18,12 @@ from watcher import CcusageCollector, CodexCollector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("token-stats")
+
+# How often an idle server wakes to check for shutdown(), not how fast it answers:
+# requests wake it immediately. Nothing calls shutdown(), since these servers run
+# on daemon threads that end with the process, so the default twice-a-second
+# wakeup would be wasted.
+SERVER_IDLE_POLL_SECS = 3600
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -31,6 +39,31 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
+
+class _SilentWSGIRequestHandler(WSGIRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+
+def _serve_in_background(server) -> threading.Thread:
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": SERVER_IDLE_POLL_SECS},
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _start_metrics_server(port: int):
+    """prometheus_client.start_http_server, which can't set the idle poll interval."""
+    server = make_server(
+        "0.0.0.0", port, make_wsgi_app(), ThreadingWSGIServer,
+        handler_class=_SilentWSGIRequestHandler,
+    )
+    _serve_in_background(server)
+    return server
 
 
 def _persist_all(collectors: list, counter_state_file: str) -> None:
@@ -259,12 +292,11 @@ def main():
     if counter_state_file:
         save_state(counter_state_file)
 
-    start_http_server(config["listen_port"])
+    _start_metrics_server(config["listen_port"])
     logger.info("Prometheus metrics on :%d/metrics", config["listen_port"])
 
     health_port = config["listen_port"] + 1
-    server = HTTPServer(("", health_port), HealthHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _serve_in_background(HTTPServer(("", health_port), HealthHandler))
     logger.info("Health endpoint on :%d/health", health_port)
 
     _install_shutdown_handlers(counter_state_file, collectors)
