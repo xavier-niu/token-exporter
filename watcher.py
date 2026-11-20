@@ -226,7 +226,8 @@ def _codex_delta(current: dict[str, int], previous: dict[str, int] | None) -> di
     return delta
 
 
-_CODEX_TOTAL_FIELDS = (
+# Token fields of a parsed file's totals, in _TOKEN_FIELDS order.
+_FILE_TOTAL_FIELDS = (
     "inputTokens",
     "outputTokens",
     "cacheCreationTokens",
@@ -235,10 +236,10 @@ _CODEX_TOTAL_FIELDS = (
 
 
 @dataclass
-class _CodexFileCacheEntry:
+class _FileCacheEntry:
     signature: tuple[int, int, int, int, int]
     since: str
-    totals: dict
+    totals: dict  # {group: {date_str: {model: {field: int}}}}
 
 
 def _file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -298,27 +299,83 @@ class _RootScan:
     data: dict
 
 
-def _prune_codex_totals(totals: dict, since_local: str) -> None:
+def _prune_file_totals(totals: dict, since_local: str) -> None:
     """Drop cached daily aggregates that have left the configured window."""
-    for project, dates in list(totals.items()):
+    for group, dates in list(totals.items()):
         for date_str in list(dates):
             if date_str < since_local:
                 del dates[date_str]
         if not dates:
-            del totals[project]
+            del totals[group]
 
 
-def _merge_codex_totals(target: dict, source: dict) -> None:
-    for project, dates in source.items():
+def _merge_file_totals(target: dict, source: dict) -> None:
+    for group, dates in source.items():
         for date_str, models in dates.items():
-            date_models = target.setdefault(project, {}).setdefault(date_str, {})
+            date_models = target.setdefault(group, {}).setdefault(date_str, {})
             for model, source_tokens in models.items():
                 tokens = date_models.setdefault(
                     model,
-                    {field: 0 for field in _CODEX_TOTAL_FIELDS},
+                    {field: 0 for field in _FILE_TOTAL_FIELDS},
                 )
-                for field in _CODEX_TOTAL_FIELDS:
+                for field in _FILE_TOTAL_FIELDS:
                     tokens[field] += source_tokens.get(field, 0)
+
+
+def _cached_totals(entry: _FileCacheEntry, since_local: str) -> dict:
+    """A cache entry's totals, pruned to the current window."""
+    if entry.since < since_local:
+        _prune_file_totals(entry.totals, since_local)
+        entry.since = since_local
+    return entry.totals
+
+
+def _with_signatures(paths):
+    """Pair each path with its file signature, or None if it can't be stat'ed."""
+    for path in paths:
+        try:
+            yield path, _file_signature(os.stat(path))
+        except OSError:
+            yield path, None
+
+
+def _scan_cached_files(files, file_cache: dict[str, _FileCacheEntry], since_local: str, parse) -> dict:
+    """Sum parse(path) over files, reparsing only the files that changed.
+
+    `files` yields (path, signature) pairs, signature None for a file that can't
+    be stat'ed. parse returns {group: {date: {model: tokens}}}, or None if the
+    file can't be read, in which case its last good totals (if any) are used.
+    Entries for files no longer listed are evicted from file_cache.
+    """
+    seen: set[str] = set()
+    agg: dict = {}
+    for path, signature in files:
+        cache_key = os.fspath(path)
+        seen.add(cache_key)
+        cached = file_cache.get(cache_key)
+        if (
+            signature is not None
+            and cached
+            and cached.signature == signature
+            and cached.since <= since_local
+        ):
+            file_totals = _cached_totals(cached, since_local)
+        else:
+            file_totals = parse(path) if signature is not None else None
+            if file_totals is None:
+                if cached:
+                    _merge_file_totals(agg, _cached_totals(cached, since_local))
+                continue
+            file_cache[cache_key] = _FileCacheEntry(
+                signature=signature,
+                since=since_local,
+                totals=file_totals,
+            )
+        _merge_file_totals(agg, file_totals)
+
+    for cache_key in file_cache.keys() - seen:
+        del file_cache[cache_key]
+    return agg
 
 
 def _parse_codex_session_file(
@@ -381,7 +438,7 @@ def _parse_codex_session_file(
                 date_models = agg.setdefault(project, {}).setdefault(date_str, {})
                 tokens = date_models.setdefault(
                     model,
-                    {field: 0 for field in _CODEX_TOTAL_FIELDS},
+                    {field: 0 for field in _FILE_TOTAL_FIELDS},
                 )
                 cached = max(delta["cached"], 0)
                 tokens["inputTokens"] += max(delta["input"] - cached, 0)
@@ -398,7 +455,7 @@ def _scan_antcodex_dir(
     since: date,
     timezone_name: str = "UTC",
     pricing_rates: dict | None = None,
-    file_cache: dict[str, _CodexFileCacheEntry] | None = None,
+    file_cache: dict[str, _FileCacheEntry] | None = None,
 ) -> dict:
     """Scan Codex JSONL sessions, reusing aggregates for unchanged files."""
     tz = ZoneInfo(timezone_name)
@@ -408,48 +465,12 @@ def _scan_antcodex_dir(
     if not sessions_dir.is_dir():
         return result
 
-    if file_cache is None:
-        file_cache = {}
-    seen: set[str] = set()
-    agg: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
-
-    for session_file in sorted(sessions_dir.rglob("*.jsonl")):
-        cache_key = os.fspath(session_file)
-        seen.add(cache_key)
-        cached = file_cache.get(cache_key)
-        try:
-            signature = _file_signature(session_file.stat())
-        except OSError:
-            if cached:
-                if cached.since < since_local:
-                    _prune_codex_totals(cached.totals, since_local)
-                    cached.since = since_local
-                _merge_codex_totals(agg, cached.totals)
-            continue
-
-        if cached and cached.signature == signature and cached.since <= since_local:
-            if cached.since < since_local:
-                _prune_codex_totals(cached.totals, since_local)
-                cached.since = since_local
-            file_totals = cached.totals
-        else:
-            file_totals = _parse_codex_session_file(session_file, since_local, tz)
-            if file_totals is None:
-                if cached:
-                    if cached.since < since_local:
-                        _prune_codex_totals(cached.totals, since_local)
-                        cached.since = since_local
-                    _merge_codex_totals(agg, cached.totals)
-                continue
-            file_cache[cache_key] = _CodexFileCacheEntry(
-                signature=signature,
-                since=since_local,
-                totals=file_totals,
-            )
-        _merge_codex_totals(agg, file_totals)
-
-    for cache_key in file_cache.keys() - seen:
-        del file_cache[cache_key]
+    agg = _scan_cached_files(
+        _with_signatures(sorted(sessions_dir.rglob("*.jsonl"))),
+        {} if file_cache is None else file_cache,
+        since_local,
+        lambda session_file: _parse_codex_session_file(session_file, since_local, tz),
+    )
 
     for project, dates in sorted(agg.items()):
         entries = []
@@ -796,7 +817,7 @@ class CodexCollector(_BaseCollector):
     def __init__(self, codex_dirs: list[str], days_back: int = 7, on_record=None, state_file: str = "", timezone_name: str = "UTC", pricing_rates: dict | None = None):
         super().__init__(codex_dirs, days_back, on_record, state_file,
                          timezone_name, pricing_rates)
-        self._file_caches: dict[str, dict[str, _CodexFileCacheEntry]] = {}
+        self._file_caches: dict[str, dict[str, _FileCacheEntry]] = {}
 
     def scan_history(self, persist=True):
         since = self._scan_since()
@@ -831,3 +852,4 @@ class CodexCollector(_BaseCollector):
                 pricing_rates=self.pricing_rates,
             )
         self._finish_scan(persist, total_records)
+
