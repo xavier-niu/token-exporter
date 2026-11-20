@@ -12,7 +12,7 @@ from prometheus_client import make_wsgi_app
 from prometheus_client.exposition import ThreadingWSGIServer
 
 import pricing
-from config import load_config
+from config import load_config, state_file_for
 from metrics import load_state, record_usage, restore_state, save_state, set_source
 from watcher import CcusageCollector, CodexCollector
 
@@ -261,9 +261,9 @@ def main():
 
     set_source(config["source"])
 
-    cc_state = config["state_file"].replace(".json", "-ccusage.json") if config["state_file"] else ""
-    codex_state = config["state_file"].replace(".json", "-codex.json") if config["state_file"] else ""
-    counter_state_file = config["state_file"].replace(".json", "-counters.json") if config["state_file"] else ""
+    cc_state = state_file_for(config["state_file"], "ccusage")
+    codex_state = state_file_for(config["state_file"], "codex")
+    counter_state_file = state_file_for(config["state_file"], "counters")
 
     if counter_state_file:
         last_totals_files = [p for p in (cc_state, codex_state) if p]

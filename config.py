@@ -1,6 +1,18 @@
 import os
 
 
+def state_file_for(state_file: str, label: str) -> str:
+    """One component's state file: /x/state.json -> /x/state-<label>.json.
+
+    The label goes before the extension, so every component gets its own file
+    even when STATE_FILE has no .json extension (or has .json elsewhere in it).
+    """
+    if not state_file:
+        return ""
+    root, ext = os.path.splitext(state_file)
+    return f"{root}-{label}{ext}"
+
+
 def load_config():
     default_claude_paths = os.path.expanduser("~/.claude,~/.codefuse/engine/cc")
     claude_dirs = os.environ.get("CLAUDE_CONFIG_DIR", default_claude_paths)

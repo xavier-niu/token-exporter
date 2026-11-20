@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import tempfile
 
-from config import load_config
+from config import load_config, state_file_for
 from projects import ClaudeProjectResolver, PROJECT_NAME_FORMAT, project_from_cwd
 from watcher import _detect_agent
 
@@ -100,10 +100,9 @@ def migrate_state(data, aliases, overrides=None):
 
 
 def state_paths(state_file):
-    if not state_file or not state_file.endswith('.json'):
-        raise ValueError('--state-file must end in .json, matching the exporter configuration')
-    return [Path(state_file.replace('.json', suffix)) for suffix in (
-        '-ccusage.json', '-codex.json', '-counters.json')]
+    if not state_file:
+        raise ValueError('--state-file is required, matching the exporter configuration')
+    return [Path(state_file_for(state_file, label)) for label in ('ccusage', 'codex', 'counters')]
 
 
 def atomic_replace(path, content):

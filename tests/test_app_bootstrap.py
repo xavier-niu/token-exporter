@@ -214,6 +214,18 @@ def test_metrics_server_answers_immediately_despite_the_long_idle_poll():
         assert b"# TYPE" in response.read()
 
 
+def test_state_files_are_distinct_without_a_json_extension():
+    from config import state_file_for
+
+    assert state_file_for("/data/state.json", "agy") == "/data/state-agy.json"
+    assert state_file_for("/srv/x.json/state.json", "agy") == "/srv/x.json/state-agy.json"
+    labels = ("ccusage", "codex", "agy", "counters")
+    paths = [state_file_for("/data/state", label) for label in labels]
+    assert len(set(paths)) == len(labels)
+    assert "/data/state" not in paths
+    assert state_file_for("", "agy") == ""
+
+
 def test_a_failing_collector_does_not_stop_the_poll_loop(monkeypatch):
     timers = []
     monkeypatch.setattr(app.threading, "Timer", lambda *args, **kwargs: timers.append(args) or MagicMock())
