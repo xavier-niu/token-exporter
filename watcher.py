@@ -1,7 +1,12 @@
 import json
 import logging
+import math
 import os
+import shutil
+import sqlite3
+import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -9,7 +14,8 @@ from zoneinfo import ZoneInfo
 
 import pricing
 from projects import (
-    ClaudeProjectResolver, PROJECT_NAME_FORMAT, check_project_name_format, project_from_cwd,
+    ClaudeProjectResolver, PROJECT_NAME_FORMAT, check_project_name_format,
+    path_from_file_uri, project_from_cwd,
 )
 from state_io import atomic_write_json
 
@@ -675,7 +681,7 @@ class _BaseCollector:
         _prune_stale_totals(self._last_totals, since)
         return since
 
-    def _scan_root(self, root, tree, inputs, scan):
+    def _scan_root(self, root, tree, inputs, scan, fingerprint=_tree_signature):
         """Return scan()'s result for a data root, rerunning it only when needed.
 
         This is what keeps an idle exporter idle: a poll costs a stat of each file
@@ -688,7 +694,7 @@ class _BaseCollector:
         retried once it changes, or at the next daily window change.
         """
         # Fingerprint first: a write racing the scan then reads as a change next poll.
-        signature = _tree_signature(tree)
+        signature = fingerprint(tree)
         previous = self._root_scans.get(root)
         if (
             previous
@@ -853,3 +859,533 @@ class CodexCollector(_BaseCollector):
             )
         self._finish_scan(persist, total_records)
 
+
+# Antigravity CLI (agy). Each conversation is a directory under brain/ whose
+# transcript logs a token-bearing entry per model step; history.jsonl and
+# conversation_summaries.db map conversations (and subagents, via their parent)
+# to workspaces.
+
+_AGY_TRANSCRIPT_NAMES = ("transcript.jsonl", "transcript_full.jsonl")
+_AGY_HISTORY = "history.jsonl"
+_AGY_SUMMARIES_DB = "conversation_summaries.db"
+# Journal files that hold committed data not yet written back into the database.
+_SQLITE_JOURNAL_SUFFIXES = ("-wal", "-journal")
+_AGY_METADATA_FILES = (
+    _AGY_HISTORY,
+    _AGY_SUMMARIES_DB,
+    *(_AGY_SUMMARIES_DB + suffix for suffix in _SQLITE_JOURNAL_SUFFIXES),
+)
+_STATE_TO_FILE_FIELD = dict(zip(_TOKEN_FIELDS, _FILE_TOTAL_FIELDS))
+
+
+def _optional_signature(path: str) -> tuple | None:
+    """A file's signature, or None if it doesn't exist. Other OSErrors propagate."""
+    try:
+        return _file_signature(os.stat(path))
+    except FileNotFoundError:
+        return None
+
+
+def _list_agy_transcripts(brain_dir: str) -> dict[str, tuple | None]:
+    """Map each conversation's transcript to its signature, without opening any.
+
+    transcript.jsonl is used when it is a regular file, else transcript_full.jsonl.
+    A transcript that can't be stat'ed maps to None, so it reads as changed once
+    it can be. Raises OSError if brain_dir itself can't be listed.
+    """
+    with os.scandir(brain_dir) as entries:
+        conv_dirs = []
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                pass  # Probed below: an unreadable conversation maps to None.
+            conv_dirs.append(entry.path)
+
+    transcripts: dict[str, tuple | None] = {}
+    for conv_dir in conv_dirs:
+        logs_dir = os.path.join(conv_dir, ".system_generated", "logs")
+        for name in _AGY_TRANSCRIPT_NAMES:
+            path = os.path.join(logs_dir, name)
+            try:
+                stat_result = os.stat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError:
+                transcripts[path] = None
+                break
+            if stat.S_ISREG(stat_result.st_mode):
+                transcripts[path] = _file_signature(stat_result)
+                break
+    return transcripts
+
+
+def _agy_root_signature(agy_dir: str) -> dict[str, tuple | None] | None:
+    """Fingerprint every file an agy scan reads, without opening any.
+
+    Covers each conversation's transcript and the project metadata, but not the
+    rest of brain/ (steps, chunks, scratch files), which no scan reads.
+    """
+    try:
+        signature = _list_agy_transcripts(os.path.join(agy_dir, "brain"))
+    except OSError:
+        return None
+    for name in _AGY_METADATA_FILES:
+        path = os.path.join(agy_dir, name)
+        try:
+            meta_signature = _optional_signature(path)
+        except OSError:
+            signature[path] = None
+        else:
+            if meta_signature is not None:
+                signature[path] = meta_signature
+    return signature
+
+
+def _non_negative_int(value) -> int:
+    """A token count as an int; anything else, NaN and infinities included, is 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    return max(int(value), 0)
+
+
+def _agy_step_usage(line: str, tz: ZoneInfo):
+    """(step_index or None, local date, model, tokens) of a transcript line, or
+    None if the line carries no usable token counts."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    tokens = {
+        "inputTokens": _non_negative_int(obj.get("input_tokens")),
+        "outputTokens": _non_negative_int(obj.get("output_tokens")),
+        "cacheCreationTokens": _non_negative_int(
+            obj.get("cache_creation_tokens") or obj.get("cache_write_tokens")
+        ),
+        "cacheReadTokens": _non_negative_int(obj.get("cache_read_tokens")),
+    }
+    if not any(tokens.values()):
+        return None
+
+    ts_str = obj.get("created_at")
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        date_str = ts.astimezone(tz).date().isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+    model = obj.get("model")
+    if not isinstance(model, str) or not model:
+        model = "unknown"
+    step_index = obj.get("step_index")
+    if not isinstance(step_index, int) or isinstance(step_index, bool):
+        step_index = None
+    return step_index, date_str, model, tokens
+
+
+def _parse_agy_transcript_file(transcript_file: str, since_local: str, tz: ZoneInfo) -> dict | None:
+    """Parse one transcript into {conversation_id: {date: {model: tokens}}}.
+
+    None means the file could not be read; an empty dict is a successful parse
+    with nothing in the window (and is cacheable). A step logged more than once
+    (streaming updates) counts once, with its latest token counts, but on the
+    day and model of its first entry: were a later entry to move it, a step
+    that straddles midnight would leave its tokens counted on the first day
+    and count them again on the next.
+    """
+    steps: dict[int, tuple[str, str, dict[str, int]]] = {}
+    unindexed: list[tuple[str, str, dict[str, int]]] = []
+    try:
+        # errors="replace": a final line cut mid-character is skipped as bad JSON.
+        with open(transcript_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                usage = _agy_step_usage(line, tz)
+                if usage is None:
+                    continue
+                step_index, date_str, model, tokens = usage
+                if step_index is None:
+                    unindexed.append((date_str, model, tokens))
+                elif step_index in steps:
+                    first_date, first_model, _ = steps[step_index]
+                    steps[step_index] = (first_date, first_model, tokens)
+                else:
+                    steps[step_index] = (date_str, model, tokens)
+    except OSError:
+        return None
+
+    totals: dict[str, dict[str, dict[str, int]]] = {}
+    for date_str, model, step_tokens in (*steps.values(), *unindexed):
+        if date_str < since_local:
+            continue
+        tokens = totals.setdefault(date_str, {}).setdefault(
+            model, {field: 0 for field in _FILE_TOTAL_FIELDS},
+        )
+        for field in _FILE_TOTAL_FIELDS:
+            tokens[field] += step_tokens[field]
+    if not totals:
+        return {}
+    # brain/<conversation id>/.system_generated/logs/<transcript>
+    return {Path(transcript_file).parents[2].name: totals}
+
+
+def _read_agy_history(history_path: str) -> dict[str, str]:
+    """Map conversation ids to workspace paths. Raises OSError if unreadable."""
+    workspaces: dict[str, str] = {}
+    with open(history_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            conv_id = obj.get("conversationId")
+            workspace = obj.get("workspace")
+            if isinstance(conv_id, str) and conv_id and isinstance(workspace, str) and workspace:
+                workspaces.setdefault(conv_id, workspace)
+    return workspaces
+
+
+def _first_workspace_path(raw_uris) -> str:
+    if not isinstance(raw_uris, str) or not raw_uris:
+        return ""
+    try:
+        uris = json.loads(raw_uris)
+    except ValueError:
+        return ""
+    if not isinstance(uris, list):
+        return ""
+    for uri in uris:
+        path = path_from_file_uri(uri)
+        if path:
+            return path
+    return ""
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of a table; empty if it doesn't exist."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _read_agy_summaries_conn(conn: sqlite3.Connection) -> tuple[dict[str, str], dict[str, str]]:
+    """Workspace and parent mappings, each read only if the schema has it, so a
+    database without one of them still yields the other."""
+    workspaces: dict[str, str] = {}
+    parents: dict[str, str] = {}
+
+    columns = _table_columns(conn, "conversation_summaries")
+    if {"conversation_id", "workspace_uris"} <= columns:
+        for conv_id, raw_uris in conn.execute(
+            "SELECT conversation_id, workspace_uris FROM conversation_summaries"
+        ):
+            path = _first_workspace_path(raw_uris)
+            if isinstance(conv_id, str) and conv_id and path:
+                workspaces[conv_id] = path
+    if {"conversation_id", "parent_conversation_id"} <= columns:
+        for conv_id, parent_id in conn.execute(
+            "SELECT conversation_id, parent_conversation_id FROM conversation_summaries"
+        ):
+            if isinstance(conv_id, str) and conv_id and isinstance(parent_id, str) and parent_id:
+                parents[conv_id] = parent_id
+
+    if {"conversation_id", "parent_id"} <= _table_columns(conn, "conversation_parents"):
+        for conv_id, parent_id in conn.execute(
+            "SELECT conversation_id, parent_id FROM conversation_parents"
+        ):
+            if isinstance(conv_id, str) and conv_id and isinstance(parent_id, str) and parent_id:
+                parents.setdefault(conv_id, parent_id)
+    return workspaces, parents
+
+
+def _copy_sqlite_files(db_path: str, dest: str, attempts: int = 3) -> None:
+    """Copy a database and its journal files, retrying if one changes mid-copy.
+
+    Raises OSError if no attempt saw the files hold still.
+    """
+    sources = [db_path + suffix for suffix in ("", *_SQLITE_JOURNAL_SUFFIXES)]
+    for _ in range(attempts):
+        before = [_optional_signature(path) for path in sources]
+        if before[0] is None:
+            raise FileNotFoundError(f"{db_path} disappeared")
+        try:
+            for path, signature in zip(sources, before):
+                target = dest + path[len(db_path):]
+                if signature is None:
+                    if os.path.lexists(target):
+                        os.unlink(target)
+                else:
+                    shutil.copyfile(path, target)
+        except FileNotFoundError:
+            continue  # A journal file was removed mid-copy: try again.
+        if [_optional_signature(path) for path in sources] == before:
+            return
+    raise OSError(f"{db_path} kept changing while it was copied")
+
+
+def _read_agy_summaries(db_path: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Workspace and parent mappings from conversation_summaries.db.
+
+    Reads a private copy. Opening agy's database in place, even with mode=ro,
+    creates -wal/-shm files beside it when its folder is writable (root-owned
+    ones agy can't then use, if the exporter runs as root), and fails on a
+    read-only mount when they are missing. Raises OSError or sqlite3.Error if
+    no consistent copy can be read.
+    """
+    with tempfile.TemporaryDirectory(prefix="agy-summaries-") as tmp_dir:
+        copy = os.path.join(tmp_dir, _AGY_SUMMARIES_DB)
+        _copy_sqlite_files(db_path, copy)
+        conn = sqlite3.connect(copy)
+        try:
+            return _read_agy_summaries_conn(conn)
+        finally:
+            conn.close()
+
+
+class _AgyMetadata:
+    """Project metadata of one agy root, re-read only when its files change."""
+
+    def __init__(self, agy_dir: str):
+        self.history_path = os.path.join(agy_dir, _AGY_HISTORY)
+        self.db_path = os.path.join(agy_dir, _AGY_SUMMARIES_DB)
+        self._history: tuple | None = None  # (signature, workspaces)
+        self._summaries: tuple | None = None  # (signatures, (workspaces, parents))
+
+    def load(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Return (workspaces, parents) by conversation id.
+
+        A missing file contributes nothing. Raises OSError or sqlite3.Error if a
+        file that exists can't be read.
+        """
+        # Stat before reading: a write racing the read then shows as a change.
+        signature = _optional_signature(self.history_path)
+        if self._history is None or self._history[0] != signature:
+            history = _read_agy_history(self.history_path) if signature else {}
+            self._history = (signature, history)
+
+        signatures = tuple(
+            _optional_signature(self.db_path + suffix)
+            for suffix in ("", *_SQLITE_JOURNAL_SUFFIXES)
+        )
+        if self._summaries is None or self._summaries[0] != signatures:
+            summaries = _read_agy_summaries(self.db_path) if signatures[0] else ({}, {})
+            self._summaries = (signatures, summaries)
+
+        db_workspaces, parents = self._summaries[1]
+        return {**self._history[1], **db_workspaces}, parents
+
+
+def _resolve_agy_project(conv_id: str, workspaces: dict[str, str], parents: dict[str, str]) -> str:
+    """Project of a conversation, or of its nearest ancestor that has a workspace."""
+    cur = conv_id
+    visited: set[str] = set()
+    while cur and cur not in visited:
+        visited.add(cur)
+        cwd = workspaces.get(cur)
+        if cwd:
+            return project_from_cwd(cwd)
+        cur = parents.get(cur, "")
+    return "unknown"
+
+
+def _scan_agy_dir(
+    agy_dir: str,
+    since: date,
+    timezone_name: str = "UTC",
+    file_cache: dict[str, _FileCacheEntry] | None = None,
+    metadata: _AgyMetadata | None = None,
+) -> dict:
+    """Token totals and project of each conversation in one agy root.
+
+    Returns {"conversations": {id: {date: {model: tokens}}}, "projects": {id: name}}.
+    Raises OSError or sqlite3.Error if brain/ or the project metadata can't be
+    read, so that the scan is retried instead of cached with its conversations
+    labelled unknown. An unreadable transcript is retried once it changes.
+    """
+    tz = ZoneInfo(timezone_name)
+    since_local = since.isoformat()
+    transcripts = _list_agy_transcripts(os.path.join(agy_dir, "brain"))
+    workspaces, parents = (metadata or _AgyMetadata(agy_dir)).load()
+    conversations = _scan_cached_files(
+        sorted(transcripts.items()),
+        {} if file_cache is None else file_cache,
+        since_local,
+        lambda path: _parse_agy_transcript_file(path, since_local, tz),
+    )
+    return {
+        "conversations": conversations,
+        "projects": {
+            conv_id: _resolve_agy_project(conv_id, workspaces, parents)
+            for conv_id in conversations
+        },
+    }
+
+
+def _emit_conversation_deltas(
+    conversations: dict,
+    projects: dict[str, str],
+    agent: str,
+    on_record,
+    last_totals: dict,
+    pricing_rates: dict | None = None,
+) -> int:
+    """Emit what each conversation added since the last scan, under its project.
+
+    The cursor is kept per conversation, keyed (agent, project, model, date,
+    conversation id), where project is the label those tokens were emitted
+    under. A conversation whose project changes (resolved late, or its
+    history.jsonl entry trimmed) therefore moves only its new tokens; what was
+    already counted stays where it was and is never counted twice. A field's
+    cursor only grows, so a transcript that reads short for a poll (caught
+    mid-rewrite) re-emits nothing once it reads whole again. A conversation
+    that loses its project keeps the last one it was emitted under.
+
+    Records are summed per (project, model, date). Cost is priced on the delta.
+    """
+    emitted: dict[tuple[str, str, str], dict[str, float]] = {}
+    remembered: dict[str, tuple[str, str]] = {}  # conversation -> (date, project)
+    for key, values in last_totals.items():
+        if len(key) != 5 or key[0] != agent:
+            continue
+        _, project, model, date_str, conv_id = key
+        done = emitted.setdefault((conv_id, model, date_str), dict.fromkeys(_TOKEN_FIELDS, 0))
+        for field in _TOKEN_FIELDS:
+            done[field] += values.get(field, 0)
+        if project != "unknown" and (
+            conv_id not in remembered or date_str > remembered[conv_id][0]
+        ):
+            remembered[conv_id] = (date_str, project)
+
+    records: dict[tuple[str, str, str], dict[str, float]] = {}
+    for conv_id, dates in conversations.items():
+        project = projects.get(conv_id, "unknown")
+        if project == "unknown" and conv_id in remembered:
+            project = remembered[conv_id][1]
+        for date_str, models in dates.items():
+            for model, tokens in models.items():
+                done = emitted.get((conv_id, model, date_str), {})
+                delta = {
+                    field: max(tokens.get(_STATE_TO_FILE_FIELD[field], 0) - done.get(field, 0), 0)
+                    for field in _TOKEN_FIELDS
+                }
+                if not any(delta.values()):
+                    continue
+                cost = pricing.cost_for(
+                    pricing_rates,
+                    model,
+                    delta["input_tokens"],
+                    delta["cache_read_tokens"],
+                    delta["output_tokens"],
+                    delta["cache_creation_tokens"],
+                    effort_suffixes=True,
+                ) if pricing_rates else 0.0
+
+                cursor = last_totals.setdefault((agent, project, model, date_str, conv_id), {})
+                record = records.setdefault(
+                    (project, model, date_str), dict.fromkeys(_STATE_FIELDS, 0),
+                )
+                for field in _TOKEN_FIELDS:
+                    cursor[field] = cursor.get(field, 0) + delta[field]
+                    record[field] += delta[field]
+                cursor["cost_usd"] = cursor.get("cost_usd", 0) + cost
+                record["cost_usd"] += cost
+
+    if on_record:
+        for (project, model, date_str), values in sorted(records.items()):
+            on_record(agent, {
+                "timestamp": datetime.fromisoformat(date_str),
+                "model": model,
+                "project": project,
+                **values,
+            })
+    return len(records)
+
+
+class AgyCollector(_BaseCollector):
+    """Collects token usage from Antigravity CLI (agy) data directories.
+
+    Parses each conversation's `brain/<id>/.system_generated/logs/transcript.jsonl`
+    directly (one count per step, cached per file), names its project from
+    `conversation_summaries.db` and `history.jsonl`, and prices token deltas
+    via the shared pricing table. Unlike the other collectors, the cursor is
+    kept per conversation; see _emit_conversation_deltas.
+    """
+
+    AGENT = "agy"
+
+    def __init__(
+        self,
+        agy_dirs: list[str],
+        days_back: int = 7,
+        on_record=None,
+        state_file: str = "",
+        timezone_name: str = "UTC",
+        pricing_rates: dict | None = None,
+    ):
+        super().__init__(
+            agy_dirs, days_back, on_record, state_file, timezone_name, pricing_rates
+        )
+        self._file_caches: dict[str, dict[str, _FileCacheEntry]] = {}
+        self._metadata: dict[str, _AgyMetadata] = {}
+        self._failing: set[str] = set()
+
+    def _scan_agy_root(self, agy_dir: str, since: date) -> dict | None:
+        """_scan_agy_dir's result, or None (logged) if the root can't be read."""
+        key = os.path.abspath(agy_dir)
+        try:
+            data = _scan_agy_dir(
+                agy_dir,
+                since,
+                self.timezone_name,
+                file_cache=self._file_caches.setdefault(key, {}),
+                metadata=self._metadata.setdefault(key, _AgyMetadata(agy_dir)),
+            )
+        except (OSError, sqlite3.Error) as e:
+            # Warn once per outage; the root is retried every poll.
+            logger.log(
+                logging.DEBUG if key in self._failing else logging.WARNING,
+                "Skipping Antigravity CLI data in %s until it can be read: %s",
+                agy_dir, e,
+            )
+            self._failing.add(key)
+            return None
+        if key in self._failing:
+            self._failing.discard(key)
+            logger.info("Antigravity CLI data in %s can be read again", agy_dir)
+        return data
+
+    def scan_history(self, persist=True):
+        since = self._scan_since()
+        conversations: dict = {}
+        projects: dict[str, str] = {}
+        for agy_dir in dict.fromkeys(self.dirs):
+            if not os.path.isdir(os.path.join(agy_dir, "brain")):
+                logger.debug("Skipping %s: no brain/ directory", agy_dir)
+                continue
+            data = self._scan_root(
+                agy_dir,
+                agy_dir,
+                (since,),
+                lambda: self._scan_agy_root(agy_dir, since),
+                fingerprint=_agy_root_signature,
+            )
+            if data is None:
+                continue
+            _merge_file_totals(conversations, data["conversations"])
+            for conv_id, project in data["projects"].items():
+                if projects.get(conv_id, "unknown") == "unknown":
+                    projects[conv_id] = project
+        total_records = _emit_conversation_deltas(
+            conversations, projects, self.AGENT, self.on_record, self._last_totals,
+            pricing_rates=self.pricing_rates,
+        )
+        self._finish_scan(persist, total_records)

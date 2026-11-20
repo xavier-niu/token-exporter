@@ -5,9 +5,26 @@ import logging
 import ntpath
 import os
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger("token-stats")
 PROJECT_NAME_FORMAT = "cwd-basename-v1"
+
+
+def path_from_file_uri(uri: str) -> str:
+    """Convert a file:// URI to a local filesystem path, or return a plain path."""
+    if not isinstance(uri, str) or not uri:
+        return ""
+    if not uri.startswith("file://"):
+        return uri
+    parsed = urlparse(uri)
+    path = unquote(parsed.path)
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        return f"//{parsed.netloc}{path}"
+    # file:///C:/Users/... parses with a leading slash before the Windows drive letter.
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":" and path[1].isalpha():
+        return path[1:]
+    return path
 
 
 def project_from_cwd(cwd: str) -> str:

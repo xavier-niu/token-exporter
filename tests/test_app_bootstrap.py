@@ -214,6 +214,40 @@ def test_metrics_server_answers_immediately_despite_the_long_idle_poll():
         assert b"# TYPE" in response.read()
 
 
+def test_config_loads_agy_dirs_default_and_override(monkeypatch):
+    import os
+    from config import load_config
+
+    monkeypatch.delenv("AGY_CONFIG_DIR", raising=False)
+    cfg = load_config()
+    assert cfg["agy_dirs"] == [os.path.expanduser("~/.gemini/antigravity-cli")]
+
+    monkeypatch.setenv("AGY_CONFIG_DIR", "/tmp/agy-a, /tmp/agy-b")
+    cfg = load_config()
+    assert cfg["agy_dirs"] == ["/tmp/agy-a", "/tmp/agy-b"]
+
+    monkeypatch.setenv("AGY_CONFIG_DIR", "")
+    cfg = load_config()
+    assert cfg["agy_dirs"] == []
+
+
+def test_agy_conversation_keys_are_summed_per_project(tmp_path):
+    path = tmp_path / "state-agy.json"
+    path.write_text(json.dumps({"last_totals": {
+        "agy\x00demo\x00gemini-3-pro\x002026-05-25\x00conv-1": {"input_tokens": 100, "cost_usd": 0.5},
+        "agy\x00demo\x00gemini-3-pro\x002026-05-25\x00conv-2": {"input_tokens": 30, "cost_usd": 0.25},
+        "agy\x00demo\x00gemini-3-pro\x002026-05-26\x00conv-1": {"input_tokens": 7},
+        "agy\x00six\x00parts\x00are\x00too\x00many": {"input_tokens": 99},
+    }}))
+    result = app._bootstrap_from_last_totals([str(path)], "host")
+    cum = {tuple(e["key"]): e["values"] for e in result["cumulative"]}
+    daily = {tuple(e["key"]): e["values"] for e in result["daily"]}
+    assert list(cum) == [("host", "agy", "demo", "gemini-3-pro")]
+    assert cum[("host", "agy", "demo", "gemini-3-pro")]["input"] == 137
+    assert cum[("host", "agy", "demo", "gemini-3-pro")]["cost"] == 0.75
+    assert daily[("host", "agy", "demo", "gemini-3-pro", "2026-05-25")]["input"] == 130
+
+
 def test_state_files_are_distinct_without_a_json_extension():
     from config import state_file_for
 

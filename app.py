@@ -14,7 +14,7 @@ from prometheus_client.exposition import ThreadingWSGIServer
 import pricing
 from config import load_config, state_file_for
 from metrics import load_state, record_usage, restore_state, save_state, set_source
-from watcher import CcusageCollector, CodexCollector
+from watcher import AgyCollector, CcusageCollector, CodexCollector
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("token-stats")
@@ -193,9 +193,10 @@ def _bootstrap_from_last_totals(last_totals_files: list[str], source: str) -> di
             continue
         for key_str, values in data.get("last_totals", {}).items():
             parts = tuple(key_str.split("\x00"))
-            if len(parts) != 4:
+            # agy keys add a conversation id, summed away here.
+            if len(parts) not in (4, 5):
                 continue
-            agent, project, model, date_str = parts
+            agent, project, model, date_str = parts[:4]
             cum_key = (source, agent, project, model)
             cum = cumulative.setdefault(cum_key, {f: 0.0 for f in field_map})
             d_key = (source, agent, project, model, date_str)
@@ -263,10 +264,11 @@ def main():
 
     cc_state = state_file_for(config["state_file"], "ccusage")
     codex_state = state_file_for(config["state_file"], "codex")
+    agy_state = state_file_for(config["state_file"], "agy")
     counter_state_file = state_file_for(config["state_file"], "counters")
 
     if counter_state_file:
-        last_totals_files = [p for p in (cc_state, codex_state) if p]
+        last_totals_files = [p for p in (cc_state, codex_state, agy_state) if p]
         state = load_state(counter_state_file)
         bootstrap = _bootstrap_from_last_totals(last_totals_files, config["source"])
         if state:
@@ -310,6 +312,18 @@ def main():
         )
         _initial_scan(codex_collector, "Codex")
         collectors.append(codex_collector)
+
+    if config["agy_dirs"]:
+        agy_collector = AgyCollector(
+            agy_dirs=config["agy_dirs"],
+            days_back=config["days_back"],
+            on_record=record_usage,
+            state_file=agy_state,
+            timezone_name=config["timezone"],
+            pricing_rates=pricing_rates,
+        )
+        _initial_scan(agy_collector, "Antigravity CLI")
+        collectors.append(agy_collector)
 
     if counter_state_file:
         save_state(counter_state_file)

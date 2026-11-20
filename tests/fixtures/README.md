@@ -99,3 +99,21 @@ ccusage needed, since antcc is parsed in-process — and also asserts hardcoded
 in-window totals so the boundary exclusion and the 05-10 streaming-dedup are
 both verified. The live-data `TestAntccCrosscheck` still skips without real
 data; this is its always-on hermetic counterpart.
+
+## `.gemini/antigravity-cli/`
+
+A sanitized, **partial** slice of a real Antigravity CLI (`agy`)
+`~/.gemini/antigravity-cli` directory. The layout mirrors production:
+
+- `history.jsonl` — prompt history mapping `conversationId` to `workspace`.
+- `brain/<conversation-id>/.system_generated/logs/transcript.jsonl` — compact
+  per-step JSONL transcript containing `PLANNER_RESPONSE` token usage fields
+  (`model`, `input_tokens`, `cache_read_tokens`, `output_tokens`, and optional
+  `cache_creation_tokens`), alongside non-token steps (`USER_INPUT`, `GENERIC`)
+  that the parser ignores.
+
+Conversation content, thinking, and tool calls are redacted. One conversation
+includes a duplicate `step_index` update to exercise per-step deduplication
+(last snapshot wins), and a second conversation exercises a different project,
+model, and `cache_creation_tokens`. Fixed dates are scanned with an unbounded
+`days_back`, matching `.codex/` and `.codefuse/`.

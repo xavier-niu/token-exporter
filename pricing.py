@@ -248,15 +248,10 @@ def _official_prefixes_for(model_variants: list[str]) -> tuple[str, ...]:
     return ()
 
 
-def lookup(rates: dict, model: str) -> dict:
-    """Find rates for model.
+_REASONING_EFFORT_SUFFIXES = ("-thinking", "-low", "-medium", "-high", "-xhigh")
 
-    Tries exact match, provider suffixes, final path segments, dotted provider
-    tails, then case/punctuation insensitive variants such as GLM5 -> glm-5.
-    """
-    if not model:
-        return {}
 
+def _lookup_direct(rates: dict, model: str) -> dict:
     model_variants = _model_key_variants(model)
     model_normalized = {
         normalized
@@ -300,8 +295,73 @@ def lookup(rates: dict, model: str) -> dict:
     return {}
 
 
-def cost_for(rates: dict, model: str, input_tokens: int, cached: int, output: int, cache_creation: int = 0) -> float:
-    spec = lookup(rates, model)
+def _lookup_effort_variant(rates: dict, model: str) -> dict:
+    """Rates of model with trailing reasoning-effort suffixes stripped, one at a time."""
+    candidate = model
+    while True:
+        lowered = candidate.lower()
+        stripped = ""
+        for suffix in _REASONING_EFFORT_SUFFIXES:
+            if lowered.endswith(suffix) and len(candidate) > len(suffix):
+                stripped = candidate[:-len(suffix)]
+                break
+        if not stripped:
+            return {}
+        spec = _lookup_direct(rates, stripped)
+        if spec:
+            if model not in _logged_effort_variants:
+                _logged_effort_variants.add(model)
+                logger.info("Pricing %r at the rates of %r", model, stripped)
+            return spec
+        candidate = stripped
+
+
+# (rates table, {(model, effort_suffixes): spec}). A rates table is replaced,
+# never mutated, when pricing reloads, so its identity keys the memo.
+_lookup_memo: tuple[dict | None, dict] = (None, {})
+_logged_effort_variants: set[str] = set()
+
+
+def lookup(rates: dict, model: str, effort_suffixes: bool = False) -> dict:
+    """Find rates for model.
+
+    Tries exact match, provider suffixes, final path segments, dotted provider
+    tails, then case/punctuation insensitive variants such as GLM5 -> glm-5.
+
+    With effort_suffixes, a model that has no entry of its own is priced as the
+    model without its trailing reasoning-effort suffixes (e.g. -high,
+    -thinking). That is only right for agents whose model names carry the
+    effort level (agy); elsewhere such a name can be a model with rates of its
+    own, which the pricing table doesn't list yet.
+    """
+    global _lookup_memo
+    if not model:
+        return {}
+
+    memo = _lookup_memo
+    if memo[0] is not rates:
+        memo = (rates, {})
+        _lookup_memo = memo
+    key = (model, effort_suffixes)
+    spec = memo[1].get(key)
+    if spec is None:
+        spec = _lookup_direct(rates, model)
+        if not spec and effort_suffixes:
+            spec = _lookup_effort_variant(rates, model)
+        memo[1][key] = spec
+    return spec
+
+
+def cost_for(
+    rates: dict,
+    model: str,
+    input_tokens: int,
+    cached: int,
+    output: int,
+    cache_creation: int = 0,
+    effort_suffixes: bool = False,
+) -> float:
+    spec = lookup(rates, model, effort_suffixes)
     if not spec:
         return 0.0
     return (

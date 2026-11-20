@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -11,7 +12,7 @@ import pytest
 
 import projects
 import watcher
-from watcher import CcusageCollector, CodexCollector
+from watcher import AgyCollector, CcusageCollector, CodexCollector
 
 # Committed, sanitized samples of real agent data directories (see fixtures/README.md).
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -19,6 +20,7 @@ CODEX_FIXTURE_DIR = FIXTURES_DIR / ".codex"
 CODEFUSE_FIXTURE_DIR = FIXTURES_DIR / ".codefuse" / "engine"
 ANTCC_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "cc"
 ANTCODEX_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "codex"
+AGY_FIXTURE_DIR = FIXTURES_DIR / ".gemini" / "antigravity-cli"
 # Fixtures carry fixed dates; scan with an effectively unbounded window so the
 # test exercises parsing/dedup, not date-window filtering, and never ages out.
 UNBOUNDED_DAYS_BACK = 100_000
@@ -1191,3 +1193,631 @@ class TestTreeSignature:
         finally:
             locked.chmod(0o700)
         assert watcher._tree_signature(str(tmp_path)) != blocked
+
+
+def _write_agy_transcript(
+    agy_dir: Path,
+    conv_id: str,
+    rows: list[dict],
+    filename: str = "transcript.jsonl",
+) -> Path:
+    path = agy_dir / "brain" / conv_id / ".system_generated" / "logs" / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    return path
+
+
+def _agy_step(
+    step_index: int,
+    day: date,
+    input_tokens: int,
+    cache_read_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    model: str = "gemini-3-pro-high",
+    status: str = "DONE",
+    second: int = 0,
+) -> dict:
+    row = {
+        "step_index": step_index,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": status,
+        "created_at": _codex_ts(day, second),
+        "model": model,
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "output_tokens": output_tokens,
+    }
+    if cache_creation_tokens:
+        row["cache_creation_tokens"] = cache_creation_tokens
+    return row
+
+
+def _create_agy_summaries_db(
+    db_path: Path,
+    summaries: list[tuple[str, list[str], str]],
+    parents: list[tuple[str, str]] = (),
+    wal: bool = False,
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE conversation_summaries ("
+        "conversation_id TEXT PRIMARY KEY, "
+        "workspace_uris TEXT NOT NULL, "
+        "parent_conversation_id TEXT NOT NULL DEFAULT ''"
+        ")"
+    )
+    conn.execute(
+        "CREATE TABLE conversation_parents ("
+        "conversation_id TEXT PRIMARY KEY, "
+        "parent_id TEXT NOT NULL"
+        ")"
+    )
+    for conv_id, uris, parent_id in summaries:
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+            (conv_id, json.dumps(uris), parent_id),
+        )
+    for conv_id, parent_id in parents:
+        conn.execute(
+            "INSERT INTO conversation_parents VALUES (?, ?)",
+            (conv_id, parent_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+class TestAgyCollector:
+    def test_parses_transcript_dedups_step_index_and_resolves_projects(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-parent", [
+            {"step_index": 0, "type": "USER_INPUT", "created_at": _codex_ts(_DAY1, 0)},
+            _agy_step(1, _DAY1, 500, 0, 20, status="RUNNING", second=1),
+            _agy_step(1, _DAY1, 1000, 0, 120, status="DONE", second=2),
+            {"step_index": 2, "type": "GENERIC", "created_at": _codex_ts(_DAY1, 3)},
+            _agy_step(3, _DAY1, 250, 1000, 80, cache_creation_tokens=50, second=4),
+        ])
+        _write_agy_transcript(agy_dir, "conv-child", [
+            _agy_step(1, _DAY1, 300, 100, 40, model="claude-opus-4-6-thinking", second=5),
+        ])
+        _write_agy_transcript(agy_dir, "conv-history", [
+            _agy_step(1, _DAY2, 400, 0, 50, model="gemini-3-pro-low", second=1),
+        ])
+        _write_agy_transcript(agy_dir, "conv-unknown", [
+            _agy_step(1, _DAY2, 100, 0, 10, model="gemini-3-pro-low", second=2),
+        ])
+        _create_agy_summaries_db(
+            agy_dir / "conversation_summaries.db",
+            summaries=[
+                ("conv-parent", ["file:///home/user/developer/token-exporter"], ""),
+                ("conv-child", [], "conv-parent"),
+            ],
+        )
+        (agy_dir / "history.jsonl").write_text(
+            json.dumps({
+                "conversationId": "conv-history",
+                "workspace": "/work/other-repo",
+            }) + "\n"
+        )
+
+        rates = {
+            "gemini/gemini-3-pro": {"input": 2.0, "cached": 0.2, "output": 12.0, "cache_creation": 0.0},
+            "claude-opus-4-6": {"input": 5.0, "cached": 0.5, "output": 25.0, "cache_creation": 6.25},
+        }
+        records = []
+        collector = AgyCollector(
+            agy_dirs=[str(agy_dir)],
+            days_back=7,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates=rates,
+        )
+        collector.scan_history()
+
+        assert all(agent == "agy" for agent, _ in records)
+        by_key = {(rec["project"], rec["model"], rec["timestamp"].date().isoformat()): rec for _, rec in records}
+        assert set(by_key) == {
+            ("token-exporter", "gemini-3-pro-high", _DAY1_STR),
+            ("token-exporter", "claude-opus-4-6-thinking", _DAY1_STR),
+            ("other-repo", "gemini-3-pro-low", _DAY2_STR),
+            ("unknown", "gemini-3-pro-low", _DAY2_STR),
+        }
+
+        parent = by_key[("token-exporter", "gemini-3-pro-high", _DAY1_STR)]
+        assert parent["input_tokens"] == 1250
+        assert parent["cache_read_tokens"] == 1000
+        assert parent["cache_creation_tokens"] == 50
+        assert parent["output_tokens"] == 200
+        assert parent["cost_usd"] == pytest.approx((1250 * 2.0 + 1000 * 0.2 + 200 * 12.0) / 1e6)
+
+        child = by_key[("token-exporter", "claude-opus-4-6-thinking", _DAY1_STR)]
+        assert child["input_tokens"] == 300
+        assert child["cache_read_tokens"] == 100
+        assert child["output_tokens"] == 40
+        assert child["cost_usd"] == pytest.approx((300 * 5.0 + 100 * 0.5 + 40 * 25.0) / 1e6)
+
+    def test_subagent_parent_cycle_and_conversation_parents_table(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "grandchild", [_agy_step(1, _DAY1, 100, 0, 10)])
+        _write_agy_transcript(agy_dir, "cycle-a", [_agy_step(1, _DAY1, 50, 0, 5)])
+        _create_agy_summaries_db(
+            agy_dir / "conversation_summaries.db",
+            summaries=[
+                ("root", ["file:///work/demo"], ""),
+                ("child", [], "root"),
+                ("cycle-a", [], "cycle-b"),
+                ("cycle-b", [], "cycle-a"),
+            ],
+            parents=[("grandchild", "child")],
+        )
+        records = []
+        AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec)).scan_history()
+        by_project = {rec["project"]: rec["input_tokens"] for rec in records}
+        assert by_project == {"demo": 100, "unknown": 50}
+
+    def test_unchanged_root_skips_scan_and_ignores_unrelated_files(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 1000, 200, 50)])
+        (agy_dir / "history.jsonl").write_text(
+            json.dumps({"conversationId": "conv-1", "workspace": "/work/demo"}) + "\n"
+        )
+        records = []
+        collector = AgyCollector(
+            agy_dirs=[str(agy_dir)],
+            on_record=lambda _, rec: records.append(rec),
+        )
+        with patch("watcher._scan_agy_dir", wraps=watcher._scan_agy_dir) as scan:
+            collector.check_updates()
+            collector.check_updates()
+            # Unrelated files under brain/ and agy root must not invalidate cache.
+            chunk = agy_dir / "brain" / "conv-1" / ".system_generated" / "logs" / "chunks" / "transcript" / "00000000.jsonl"
+            chunk.parent.mkdir(parents=True)
+            chunk.write_text('{"step_index":1,"input_tokens":99999}\n')
+            scratch = agy_dir / "brain" / "conv-1" / "scratch" / "note.txt"
+            scratch.parent.mkdir(parents=True)
+            scratch.write_text("hello")
+            (agy_dir / "cli.log").write_text("log line\n")
+            collector.check_updates()
+        assert scan.call_count == 1
+        assert len(records) == 1
+        assert records[0]["input_tokens"] == 1000
+
+    def test_append_and_partial_final_line_count_delta_once(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        first = _agy_step(1, _DAY1, 1000, 0, 50, second=1)
+        second = _agy_step(3, _DAY1, 400, 1000, 80, second=2)
+        second_line = json.dumps(second)
+        split_at = len(second_line) // 2
+        transcript = agy_dir / "brain" / "conv-1" / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps(first) + "\n" + second_line[:split_at])
+
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        assert len(records) == 1
+        assert records[0]["input_tokens"] == 1000
+        records.clear()
+
+        with transcript.open("a") as f:
+            f.write(second_line[split_at:] + "\n")
+        collector.check_updates()
+        collector.check_updates()
+        assert len(records) == 1
+        assert records[0]["input_tokens"] == 400
+        assert records[0]["cache_read_tokens"] == 1000
+        assert records[0]["output_tokens"] == 80
+
+    def test_late_project_moves_only_new_tokens(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 500, 0, 25)])
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        assert [(rec["project"], rec["input_tokens"]) for rec in records] == [("unknown", 500)]
+
+        with patch("watcher._parse_agy_transcript_file", wraps=watcher._parse_agy_transcript_file) as parse_file:
+            (agy_dir / "history.jsonl").write_text(
+                json.dumps({"conversationId": "conv-1", "workspace": "/work/resolved-proj"}) + "\n"
+            )
+            collector.check_updates()
+        parse_file.assert_not_called()
+        # Already counted under unknown: counting it again under the project would double it.
+        assert len(records) == 1
+
+        with transcript.open("a") as f:
+            f.write(json.dumps(_agy_step(2, _DAY1, 300, 0, 5)) + "\n")
+        collector.check_updates()
+        assert [(rec["project"], rec["input_tokens"]) for rec in records[1:]] == [("resolved-proj", 300)]
+
+    def test_project_that_comes_and_goes_is_never_counted_twice(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-a", [_agy_step(1, _DAY1, 100)])
+        x_transcript = _write_agy_transcript(agy_dir, "conv-x", [_agy_step(1, _DAY1, 50)])
+        history = agy_dir / "history.jsonl"
+        mapped = json.dumps({"conversationId": "conv-x", "workspace": "/w/proj"}) + "\n"
+        history.write_text(mapped)
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        for _ in range(3):
+            history.write_text("")  # e.g. history.jsonl trimmed
+            collector.check_updates()
+            history.write_text(mapped)
+            collector.check_updates()
+
+        history.write_text("")
+        with x_transcript.open("a") as f:
+            f.write(json.dumps(_agy_step(2, _DAY1, 20)) + "\n")
+        collector.check_updates()
+
+        by_project = {}
+        for rec in records:
+            by_project[rec["project"]] = by_project.get(rec["project"], 0) + rec["input_tokens"]
+        # conv-x keeps the project it was counted under after losing its entry.
+        assert by_project == {"unknown": 100, "proj": 70}
+
+    def test_step_that_straddles_midnight_stays_on_its_first_day(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        running = {**_agy_step(1, _DAY1, 500, 0, 20, status="RUNNING"), "created_at": f"{_DAY1_STR}T23:59:59Z"}
+        done = {**_agy_step(1, _DAY2, 1000, 0, 120), "created_at": f"{_DAY2_STR}T00:00:01Z"}
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [running])
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        with transcript.open("a") as f:
+            f.write(json.dumps(done) + "\n")
+        collector.check_updates()
+
+        assert {rec["timestamp"].date().isoformat() for rec in records} == {_DAY1_STR}
+        assert sum(rec["input_tokens"] for rec in records) == 1000
+        assert sum(rec["output_tokens"] for rec in records) == 120
+
+    def test_transcript_read_short_mid_rewrite_is_not_counted_again(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        steps = [_agy_step(1, _DAY1, 1000, 0, 50), _agy_step(2, _DAY1, 400, 0, 10)]
+        _write_agy_transcript(agy_dir, "conv-1", steps)
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        _write_agy_transcript(agy_dir, "conv-1", steps[:1])
+        collector.check_updates()
+        _write_agy_transcript(agy_dir, "conv-1", steps)
+        collector.check_updates()
+        assert [rec["input_tokens"] for rec in records] == [1400]
+
+    def test_deleted_conversation_evicts_file_cache(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 500, 0, 25)])
+        collector = AgyCollector([str(agy_dir)])
+        collector.scan_history()
+        directory_cache = collector._file_caches[os.path.abspath(agy_dir)]
+        assert len(directory_cache) == 1
+
+        transcript.unlink()
+        collector.scan_history()
+        assert directory_cache == {}
+
+    def test_window_change_prunes_cached_totals_without_reparsing(self, tmp_path):
+        initial_now = datetime.combine(_DAY2, datetime.min.time(), timezone.utc)
+        later_now = initial_now + timedelta(days=10)
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 500, 0, 25)])
+        collector = AgyCollector([str(agy_dir)], days_back=7)
+
+        with patch("watcher._utcnow", return_value=initial_now):
+            collector.scan_history()
+        with patch("watcher._utcnow", return_value=later_now), patch(
+            "watcher._parse_agy_transcript_file",
+            wraps=watcher._parse_agy_transcript_file,
+        ) as parse_file:
+            collector.scan_history()
+
+        parse_file.assert_not_called()
+        directory_cache = collector._file_caches[os.path.abspath(agy_dir)]
+        assert len(directory_cache) == 1
+        assert next(iter(directory_cache.values())).totals == {}
+
+    def test_each_delta_is_priced_at_the_rates_in_effect(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 1000, 200, 50, model="gemini-3-pro-high")])
+        records = []
+        collector = AgyCollector(
+            [str(agy_dir)],
+            on_record=lambda _, rec: records.append(rec),
+            pricing_rates={"gemini/gemini-3-pro": {"input": 1.0, "cached": 0.1, "output": 2.0}},
+        )
+        collector.check_updates()
+        first_cost = (1000 * 1.0 + 200 * 0.1 + 50 * 2.0) / 1e6
+        assert records[0]["cost_usd"] == pytest.approx(first_cost)
+
+        with patch("watcher._scan_agy_dir", wraps=watcher._scan_agy_dir) as scan:
+            collector.pricing_rates = {"gemini/gemini-3-pro": {"input": 10.0, "cached": 1.0, "output": 20.0}}
+            collector.check_updates()
+        # Costs are priced on deltas, so new rates need no rescan and change nothing already counted.
+        assert scan.call_count == 0
+        assert len(records) == 1
+
+        with transcript.open("a") as f:
+            f.write(json.dumps(_agy_step(2, _DAY1, 100, 0, 10, model="gemini-3-pro-high")) + "\n")
+        collector.check_updates()
+        assert records[1]["cost_usd"] == pytest.approx((100 * 10.0 + 10 * 20.0) / 1e6)
+        cursor_cost = sum(values["cost_usd"] for values in collector._last_totals.values())
+        assert cursor_cost == pytest.approx(first_cost + records[1]["cost_usd"])
+
+    def test_restart_does_not_double_count(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        state_file = tmp_path / "agy-state.json"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 1000, 200, 50)])
+
+        first_records = []
+        AgyCollector(
+            [str(agy_dir)],
+            state_file=str(state_file),
+            on_record=lambda _, rec: first_records.append(rec),
+        ).scan_history()
+
+        restarted_records = []
+        AgyCollector(
+            [str(agy_dir)],
+            state_file=str(state_file),
+            on_record=lambda _, rec: restarted_records.append(rec),
+        ).scan_history()
+
+        assert len(first_records) == 1
+        assert restarted_records == []
+
+    def test_transcript_full_fallback_and_timezone(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        # 2026-..-.. 20:00 UTC is the next calendar day in Asia/Shanghai (+08:00).
+        row = {
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": f"{_DAY1_STR}T20:00:00Z",
+            "model": "gemini-3-pro-high",
+            "input_tokens": 700,
+            "cache_read_tokens": 0,
+            "output_tokens": 30,
+        }
+        _write_agy_transcript(agy_dir, "conv-1", [row], filename="transcript_full.jsonl")
+        records = []
+        AgyCollector(
+            [str(agy_dir)],
+            timezone_name="Asia/Shanghai",
+            on_record=lambda _, rec: records.append(rec),
+        ).scan_history()
+        assert len(records) == 1
+        assert records[0]["timestamp"].date().isoformat() == _DAY2_STR
+        assert records[0]["input_tokens"] == 700
+
+    def test_uncheckpointed_wal_rows_are_read(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        db_path = agy_dir / "conversation_summaries.db"
+        _create_agy_summaries_db(
+            db_path,
+            summaries=[("conv-1", ["file:///work/wal-project"], "")],
+            wal=True,
+        )
+        # Keep a WAL writer open so its changes sit in -wal (not checkpointed).
+        writer = sqlite3.connect(str(db_path))
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+            ("conv-2", json.dumps(["file:///work/uncheckpointed-proj"]), ""),
+        )
+        writer.commit()
+        try:
+            workspaces, _ = watcher._read_agy_summaries(str(db_path))
+        finally:
+            writer.close()
+        assert workspaces["conv-1"] == "/work/wal-project"
+        assert workspaces["conv-2"] == "/work/uncheckpointed-proj"
+
+    def test_reading_summaries_db_leaves_agy_folder_untouched(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 100)])
+        _create_agy_summaries_db(
+            agy_dir / "conversation_summaries.db",
+            summaries=[("conv-1", ["file:///work/demo"], "")],
+            wal=True,
+        )
+        before = sorted(os.listdir(agy_dir))
+        assert before == ["brain", "conversation_summaries.db"]
+        records = []
+        AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec)).scan_history()
+        assert [rec["project"] for rec in records] == ["demo"]
+        # Opening the database in place would leave -wal/-shm files here.
+        assert sorted(os.listdir(agy_dir)) == before
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    def test_summaries_db_on_read_only_folder_is_read(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 100)])
+        _create_agy_summaries_db(
+            agy_dir / "conversation_summaries.db",
+            summaries=[("conv-1", ["file:///work/demo"], "")],
+            wal=True,
+        )
+        records = []
+        agy_dir.chmod(0o555)  # As on a Docker :ro mount while agy isn't running.
+        try:
+            AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec)).scan_history()
+        finally:
+            agy_dir.chmod(0o755)
+        assert [rec["project"] for rec in records] == ["demo"]
+
+    def test_workspaces_are_read_from_a_schema_without_parent_links(self, tmp_path):
+        db_path = tmp_path / "conversation_summaries.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE conversation_summaries (conversation_id TEXT, workspace_uris TEXT)")
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?)",
+            ("conv-1", json.dumps(["file:///work/demo"])),
+        )
+        conn.commit()
+        conn.close()
+        assert watcher._read_agy_summaries(str(db_path)) == ({"conv-1": "/work/demo"}, {})
+
+    def test_unreadable_summaries_db_is_retried_not_labelled_unknown(self, tmp_path, caplog):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 500)])
+        db_path = agy_dir / "conversation_summaries.db"
+        db_path.write_bytes(b"not a database" * 100)
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        with caplog.at_level("DEBUG", logger="token-stats"):
+            collector.check_updates()
+            collector.check_updates()
+        assert records == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1  # Once per outage, not every poll.
+
+        db_path.unlink()
+        _create_agy_summaries_db(db_path, summaries=[("conv-1", ["file:///work/demo"], "")])
+        collector.check_updates()
+        assert [(rec["project"], rec["input_tokens"]) for rec in records] == [("demo", 500)]
+
+    def test_unchanged_metadata_is_not_reread_when_a_transcript_grows(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 100)])
+        (agy_dir / "history.jsonl").write_text(
+            json.dumps({"conversationId": "conv-1", "workspace": "/work/demo"}) + "\n"
+        )
+        _create_agy_summaries_db(agy_dir / "conversation_summaries.db", summaries=[])
+        collector = AgyCollector([str(agy_dir)])
+        collector.check_updates()
+        with patch("watcher._read_agy_history", wraps=watcher._read_agy_history) as history, patch(
+            "watcher._read_agy_summaries", wraps=watcher._read_agy_summaries,
+        ) as summaries, patch(
+            "watcher._scan_agy_dir", wraps=watcher._scan_agy_dir,
+        ) as scan:
+            with transcript.open("a") as f:
+                f.write(json.dumps(_agy_step(2, _DAY1, 50)) + "\n")
+            collector.check_updates()
+        assert scan.call_count == 1
+        history.assert_not_called()
+        summaries.assert_not_called()
+
+    def test_final_line_cut_mid_character_is_skipped(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        partial = json.dumps({**_agy_step(2, _DAY1, 400), "note": "中文"}, ensure_ascii=False).encode()
+        partial = partial[:partial.index("中".encode()) + 1]
+        transcript = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 1000)])
+        with transcript.open("ab") as f:
+            f.write(partial)
+        records = []
+        AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec)).check_updates()
+        assert [rec["input_tokens"] for rec in records] == [1000]
+
+    def test_non_finite_token_counts_count_as_zero(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [
+            _agy_step(1, _DAY1, float("nan"), 0, 10),
+            _agy_step(2, _DAY1, float("inf"), 0, 5),
+            _agy_step(3, _DAY1, 100, 0, float("-inf")),
+        ])
+        records = []
+        AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec)).check_updates()
+        assert [(rec["input_tokens"], rec["output_tokens"]) for rec in records] == [(100, 15)]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    def test_unreadable_conversation_is_skipped_until_readable(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 1000)])
+        _write_agy_transcript(agy_dir, "conv-2", [_agy_step(1, _DAY1, 300)])
+        locked = agy_dir / "brain" / "conv-2" / ".system_generated"
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        locked.chmod(0)
+        try:
+            collector.check_updates()
+            assert [rec["input_tokens"] for rec in records] == [1000]
+        finally:
+            locked.chmod(0o755)
+        collector.check_updates()
+        assert [rec["input_tokens"] for rec in records] == [1000, 300]
+
+    def test_transcript_choice_matches_change_detection(self, tmp_path):
+        agy_dir = tmp_path / ".gemini" / "antigravity-cli"
+        # transcript.jsonl exists but isn't a regular file, so the full transcript is read.
+        full = _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 100)], filename="transcript_full.jsonl")
+        (full.parent / "transcript.jsonl").mkdir()
+        records = []
+        collector = AgyCollector([str(agy_dir)], on_record=lambda _, rec: records.append(rec))
+        collector.check_updates()
+        with full.open("a") as f:
+            f.write(json.dumps(_agy_step(2, _DAY1, 50)) + "\n")
+        collector.check_updates()
+        assert [rec["input_tokens"] for rec in records] == [100, 50]
+
+    def test_agent_is_agy_wherever_the_folder_lives(self, tmp_path):
+        agy_dir = tmp_path / "home" / "codex" / ".gemini" / "antigravity-cli"
+        _write_agy_transcript(agy_dir, "conv-1", [_agy_step(1, _DAY1, 100)])
+        records = []
+        AgyCollector([str(agy_dir)], on_record=lambda agent, rec: records.append(agent)).scan_history()
+        assert records == ["agy"]
+
+    def test_skips_missing_or_empty_brain_dir(self, tmp_path):
+        records = []
+        AgyCollector(
+            [str(tmp_path / "nonexistent"), str(tmp_path)],
+            on_record=lambda _, rec: records.append(rec),
+        ).scan_history()
+        assert records == []
+
+
+class TestAgyFixture(unittest.TestCase):
+    """Parse the committed, sanitized real-world Antigravity CLI fixture end-to-end."""
+
+    def _collect(self, pricing_rates=None):
+        records = []
+        collector = AgyCollector(
+            agy_dirs=[str(AGY_FIXTURE_DIR)],
+            days_back=UNBOUNDED_DAYS_BACK,
+            on_record=lambda agent, rec: records.append((agent, rec)),
+            pricing_rates=pricing_rates,
+        )
+        collector.scan_history()
+        return records
+
+    def test_aggregates_tokens_dedups_steps_and_ignores_non_token_events(self):
+        records = self._collect()
+
+        assert len(records) == 2
+        by_project = {rec["project"]: (agent, rec) for agent, rec in records}
+        assert set(by_project) == {"demo-api", "demo-web"}
+
+        agent, api = by_project["demo-api"]
+        assert agent == "agy"
+        assert api["model"] == "gemini-3-pro-high"
+        # step 1 duplicate (500/20 -> 1000/150) deduped + step 3 (400/1000/250)
+        assert api["input_tokens"] == 1400
+        assert api["cache_read_tokens"] == 1000
+        assert api["cache_creation_tokens"] == 0
+        assert api["output_tokens"] == 400
+        assert api["timestamp"].date().isoformat() == "2026-05-25"
+
+        agent2, web = by_project["demo-web"]
+        assert agent2 == "agy"
+        assert web["model"] == "claude-opus-4-6-thinking"
+        assert web["input_tokens"] == 600
+        assert web["cache_read_tokens"] == 2000
+        assert web["cache_creation_tokens"] == 300
+        assert web["output_tokens"] == 120
+        assert web["timestamp"].date().isoformat() == "2026-05-26"
+
+    def test_applies_pricing_with_reasoning_effort_fallback_to_fixture(self):
+        rates = {
+            "gemini/gemini-3-pro": {"input": 2.0, "cached": 0.2, "output": 12.0, "cache_creation": 0.0},
+            "claude-opus-4-6": {"input": 5.0, "cached": 0.5, "output": 25.0, "cache_creation": 6.25},
+        }
+        records = self._collect(pricing_rates=rates)
+        cost = {rec["project"]: rec["cost_usd"] for _, rec in records}
+        assert cost["demo-api"] == pytest.approx((1400 * 2.0 + 1000 * 0.2 + 400 * 12.0) / 1e6)
+        assert cost["demo-web"] == pytest.approx(
+            (600 * 5.0 + 2000 * 0.5 + 300 * 6.25 + 120 * 25.0) / 1e6
+        )

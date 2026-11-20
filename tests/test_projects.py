@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from projects import ClaudeProjectResolver, project_from_cwd
-from watcher import CcusageCollector, CodexCollector
+from projects import ClaudeProjectResolver, path_from_file_uri, project_from_cwd
+from watcher import AgyCollector, CcusageCollector, CodexCollector
 
 
 def project_dir(root, cwd, key=None):
@@ -97,6 +97,18 @@ def test_windows_cwd_uses_same_shared_basename_rule():
     assert project_from_cwd('C:\\Users\\byte\\work\\my-project\\') == 'my-project'
 
 
+@pytest.mark.parametrize('uri,expected_path,expected_project', [
+    ('file:///home/nxw/developer/token-exporter', '/home/nxw/developer/token-exporter', 'token-exporter'),
+    ('file:///home/nxw/my%20repo/', '/home/nxw/my repo/', 'my repo'),
+    ('file:///C:/Users/byte/work/my-project', 'C:/Users/byte/work/my-project', 'my-project'),
+    ('/plain/path/demo-tool', '/plain/path/demo-tool', 'demo-tool'),
+    ('', '', 'unknown'),
+])
+def test_file_uri_uses_same_basename_rule(uri, expected_path, expected_project):
+    assert path_from_file_uri(uri) == expected_path
+    assert project_from_cwd(path_from_file_uri(uri)) == expected_project
+
+
 def test_multiple_checkouts_and_config_roots_are_summed_before_deltas(tmp_path):
     first = tmp_path / 'one' / '.claude'
     second = tmp_path / 'two' / '.claude'
@@ -167,6 +179,27 @@ def test_codex_basename_is_not_encoded_and_truncated_again(tmp_path):
     records = []
     CodexCollector([str(root)], on_record=lambda _, record: records.append(record)).scan_history()
     assert records[0]['project'] == 'one-two-three-four-five'
+
+
+def test_agy_uses_shared_cwd_basename_rule(tmp_path):
+    root = tmp_path / '.gemini' / 'antigravity-cli'
+    transcript = root / 'brain' / 'conv-1' / '.system_generated' / 'logs' / 'transcript.jsonl'
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({
+        'step_index': 1, 'type': 'PLANNER_RESPONSE', 'status': 'DONE',
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'model': 'gemini-3-pro-high', 'input_tokens': 123, 'output_tokens': 45,
+    }) + '\n')
+    (root / 'history.jsonl').write_text(json.dumps({
+        'conversationId': 'conv-1',
+        'workspace': '/mnt/custom/team/my-repo.v2_tools',
+    }) + '\n')
+    records = []
+    AgyCollector([str(root)], on_record=lambda agent, record: records.append((agent, record))).scan_history()
+    assert len(records) == 1
+    assert records[0][0] == 'agy'
+    assert records[0][1]['project'] == 'my-repo.v2_tools'
+    assert records[0][1]['input_tokens'] == 123
 
 
 @pytest.mark.skipif(not shutil.which('ccusage'), reason='ccusage CLI not installed')

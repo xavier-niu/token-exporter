@@ -22,6 +22,10 @@ def load_config():
     codex_dirs = os.environ.get("CODEX_CONFIG_DIR", default_codex_paths)
     codex_paths = [os.path.expanduser(p.strip()) for p in codex_dirs.split(",") if p.strip()]
 
+    default_agy_paths = os.path.expanduser("~/.gemini/antigravity-cli")
+    agy_dirs = os.environ.get("AGY_CONFIG_DIR", default_agy_paths)
+    agy_paths = [os.path.expanduser(p.strip()) for p in agy_dirs.split(",") if p.strip()]
+
     watch_interval = int(os.environ.get("WATCH_INTERVAL", "60"))
     # Persisting more often than we scan is pointless (state only changes on a
     # scan) and a non-positive value would fsync every cycle; floor at the scan
@@ -34,6 +38,7 @@ def load_config():
         "persist_interval": persist_interval,
         "claude_dirs": claude_paths,
         "codex_dirs": codex_paths,
+        "agy_dirs": agy_paths,
         "days_back": int(os.environ.get("DAYS_BACK", "7")),
         "source": os.environ.get("SOURCE", ""),
         "state_file": os.path.expanduser(os.environ.get("STATE_FILE", "~/.token-exporter/state.json")),

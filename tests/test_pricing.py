@@ -156,6 +156,50 @@ class TestLookup:
     def test_empty_model_name(self):
         assert pricing.lookup({"gpt-5": {"input": 1}}, "") == {}
 
+    def test_reasoning_effort_suffix_fallback(self):
+        rates = {
+            "gemini/gemini-3-pro": {"input": 2.0, "output": 12.0, "cached": 0.2},
+            "claude-opus-4-6": {"input": 5.0, "output": 25.0, "cached": 0.5},
+        }
+        def lookup(model):
+            return pricing.lookup(rates, model, effort_suffixes=True)
+        assert lookup("gemini-3-pro-high") == rates["gemini/gemini-3-pro"]
+        assert lookup("gemini-3-pro-low") == rates["gemini/gemini-3-pro"]
+        assert lookup("claude-opus-4-6-thinking") == rates["claude-opus-4-6"]
+        assert lookup("claude-opus-4-6-thinking-high") == rates["claude-opus-4-6"]
+
+    def test_effort_suffixes_are_kept_unless_asked(self):
+        # A suffixed name elsewhere can be a model with rates of its own that
+        # the table doesn't list yet; pricing it as the base model would hide that.
+        rates = {"gemini-2.5-flash": {"input": 0.3, "output": 2.5}}
+        assert pricing.lookup(rates, "gemini-2.5-flash-thinking") == {}
+        assert pricing.cost_for(rates, "gemini-2.5-flash-thinking", 1_000_000, 0, 0) == 0.0
+        assert pricing.cost_for(
+            rates, "gemini-2.5-flash-thinking", 1_000_000, 0, 0, effort_suffixes=True,
+        ) == pytest.approx(0.3)
+
+    def test_exact_suffixed_rate_wins_over_stripped_fallback(self):
+        rates = {
+            "gemini-3-pro": {"input": 2.0},
+            "gemini-3-pro-high": {"input": 4.0},
+        }
+        assert pricing.lookup(rates, "gemini-3-pro-high", effort_suffixes=True) == {"input": 4.0}
+
+    def test_max_model_name_is_not_stripped(self):
+        rates = {"qwen": {"input": 0.5}}
+        assert pricing.lookup(rates, "qwen-max", effort_suffixes=True) == {}
+
+    def test_lookups_are_memoized_per_rates_table(self):
+        rates = {"gemini/gemini-3-pro": {"input": 2.0}}
+        with patch("pricing._lookup_direct", wraps=pricing._lookup_direct) as direct:
+            for _ in range(3):
+                assert pricing.lookup(rates, "gemini-3-pro-high", effort_suffixes=True) == {"input": 2.0}
+                assert pricing.lookup(rates, "mystery-model") == {}
+            # One miss on the suffixed name, one hit once stripped, one miss.
+            assert direct.call_count == 3
+            reloaded = {"gemini/gemini-3-pro": {"input": 3.0}}
+            assert pricing.lookup(reloaded, "gemini-3-pro-high", effort_suffixes=True) == {"input": 3.0}
+
 
 class TestCostFor:
     def test_known_model(self):
