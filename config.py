@@ -14,7 +14,7 @@ def state_file_for(state_file: str, label: str) -> str:
 
 
 def load_config():
-    default_claude_paths = os.path.expanduser("~/.claude,~/.codefuse/engine/cc")
+    default_claude_paths = os.path.expanduser("~/.claude")
     claude_dirs = os.environ.get("CLAUDE_CONFIG_DIR", default_claude_paths)
     claude_paths = [os.path.expanduser(p.strip()) for p in claude_dirs.split(",") if p.strip()]
 

@@ -1,6 +1,6 @@
 # Token Exporter
 
-A Prometheus exporter that watches Claude Code, AntCC, Codex, CodeFuse Codex, and Antigravity CLI (`agy`) JSONL conversation files and exposes token usage metrics.
+A Prometheus exporter that watches Claude Code, Codex, CodeFuse Codex, and Antigravity CLI (`agy`) JSONL conversation files and exposes token usage metrics.
 
 ## Grafana Dashboard
 
@@ -9,7 +9,7 @@ A Prometheus exporter that watches Claude Code, AntCC, Codex, CodeFuse Codex, an
 Import `grafana/dashboards/token-stats.json` or use the included provisioning. The dashboard includes:
 
 - **All Agents** — combined summary stats and per-agent timeseries
-- **Per-Agent Groups** — auto-generated sections for each agent (antcc, cc, codex, antcodex, agy) with:
+- **Per-Agent Groups** — auto-generated sections for each agent (cc, codex, antcodex, agy) with:
   - Summary stats: total, input, output, cache tokens, cache hit rate
   - Token Usage chart — stacked timeseries of input/output/cache read/cache creation
   - Cache Hit Rate chart — `cache_read / (cache_read + input)` over time
@@ -19,7 +19,7 @@ Import `grafana/dashboards/token-stats.json` or use the included provisioning. T
 
 - Tracks input, output, cache creation, and cache read tokens per agent and model
 - Tracks cost in USD
-- Supports multiple agents: Claude Code, AntCC (CodeFuse), Codex, CodeFuse Codex, Antigravity CLI (`agy`)
+- Supports multiple agents: Claude Code, Codex, CodeFuse Codex, Antigravity CLI (`agy`)
 - Configurable source label for multi-machine setups
 - Persists watcher state to avoid double-counting JSONL history after restarts
 - Grafana dashboard included
@@ -51,7 +51,7 @@ docker run -d \
 | `LISTEN_PORT` | `14531` | Prometheus metrics port |
 | `WATCH_INTERVAL` | `60` | Seconds between checks for changed session files (how fresh the exposed metrics are). A root with no changed files costs only a `stat` per file; `ccusage` and the JSONL parsers run only for roots that changed, and once a day when the scan window moves |
 | `PERSIST_INTERVAL` | `600` | Seconds between state-file flushes; a crash re-emits at most this much usage on restart (idempotent, no double count) |
-| `CLAUDE_CONFIG_DIR` | `~/.claude,~/.codefuse/engine/cc` | Comma-separated Claude Code/AntCC config directories using `projects/` subdirs |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Comma-separated Claude Code config directories using `projects/` subdirs. AntCC directories (`~/.codefuse/engine/cc`) are no longer supported and are skipped with a warning |
 | `CODEX_CONFIG_DIR` | `~/.codex,~/.codefuse/engine/codex` | Comma-separated Codex/CodeFuse Codex config directories using `sessions/` subdirs |
 | `AGY_CONFIG_DIR` | `~/.gemini/antigravity-cli` | Comma-separated Antigravity CLI (`agy`) config directories using `brain/` subdirs |
 | `DAYS_BACK` | `7` | Days of history to scan on startup |
@@ -65,7 +65,7 @@ docker run -d \
 
 Claude Code (`cc`) records are read through `ccusage claude daily`, with costs
 computed from the shared pricing map (falling back to ccusage's offline snapshot
-for unknown models). AntCC, Codex, CodeFuse Codex, and Antigravity CLI (`agy`)
+for unknown models). Codex, CodeFuse Codex, and Antigravity CLI (`agy`)
 are parsed directly by this exporter, so their costs come from the
 shared pricing map plus any `PRICING_FILE` overrides. The shared map is built
 from LiteLLM plus official provider sources where available. GLM text model
@@ -82,7 +82,7 @@ and `moonshot/` for Kimi, rather than third-party-hosted copies.
 ## Metrics
 
 Projects use the working directory's basename for every agent. Claude Code
-and AntCC read the original path from `sessions-index.json` (`originalPath`)
+reads the original path from `sessions-index.json` (`originalPath`)
 or the parent session's JSONL `cwd`; Codex uses its session metadata; and
 Antigravity CLI (`agy`) uses workspace metadata from `conversation_summaries.db`
 (with subagent parent fallback) and `history.jsonl`. Thus

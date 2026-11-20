@@ -148,24 +148,6 @@ def test_multiple_checkouts_and_config_roots_are_summed_before_deltas(tmp_path):
         assert len(records) == 2
 
 
-def test_antcc_also_uses_cwd_basename(tmp_path):
-    root = tmp_path / '.codefuse' / 'engine' / 'cc'
-    cwd = '/an/arbitrary/deep/path/my-project'
-    directory = project_dir(root, cwd)
-    (directory / 'session.jsonl').write_text(json.dumps({
-        'cwd': cwd, 'type': 'assistant', 'timestamp': datetime.now(timezone.utc).isoformat(),
-        'message': {'id': 'msg-1', 'model': 'fixture', 'usage': {'input_tokens': 123}},
-    }) + '\n')
-    records = []
-    collector = CcusageCollector([str(root)], on_record=lambda agent, record: records.append((agent, record)))
-    collector.scan_history()
-    collector.check_updates()
-    assert len(records) == 1
-    assert records[0][0] == 'antcc'
-    assert records[0][1]['project'] == 'my-project'
-    assert records[0][1]['input_tokens'] == 123
-
-
 def test_codex_basename_is_not_encoded_and_truncated_again(tmp_path):
     root = tmp_path / '.codex'
     session = root / 'sessions' / 'session.jsonl'

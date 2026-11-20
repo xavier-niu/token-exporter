@@ -6,7 +6,7 @@ tests run against realistic input instead of inline dicts.
 **Building or refreshing a fixture?** See [`.codex/README.md`](.codex/README.md)
 for the step-by-step construction recipe (sanitization snippet, the exact fields
 each parser reads, how to compute expected aggregates, and per-agent layout for
-codex / antcodex / antcc / Claude Code).
+codex / antcodex / Claude Code).
 
 ## `.codex/`
 
@@ -47,23 +47,6 @@ snapshots from the source session. Conversation-bearing fields are redacted
 and similar text payloads), so `TestAntcodexFixture` checks realistic input
 without shipping private conversation text.
 
-## `.codefuse/engine/cc/`
-
-A sanitized, **partial** slice of a real AntCC `~/.codefuse/engine/cc`
-directory. The layout mirrors production:
-`projects/<project-key>/**/*.jsonl`.
-
-The fixture keeps the real JSONL envelope and metadata, including paths, ids,
-versions, timestamps, model names, and token usage from a streaming assistant
-response. Conversation-bearing fields are redacted (`message.content`, file
-snapshots, tool results, last prompt text, and similar payloads). The three
-assistant records share the same real `message.id` and intentionally omit
-`requestId`, matching the source AntCC envelope. The first two records carry the
-initial usage and the final record carries the completed usage.
-`TestAntccFixture` asserts the parser's message-id dedup behavior by expecting
-only the last usage snapshot to count, and that costs come from the shared
-pricing table when rates are available.
-
 ## `.claude/`
 
 A sanitized, **partial** Claude Code history: `projects/<key>/*.jsonl` with
@@ -83,23 +66,6 @@ where ccusage isn't installed. The fixture includes a duplicate `message.id` +
 `requestId` line to exercise ccusage's dedup, and uses fixed dates scanned with
 an unbounded `days_back` (same rationale as `.codex/`).
 
-## `window/.codefuse/engine/cc/`
-
-A second antcc fixture, separate from `.codefuse/engine/cc/` so it doesn't
-perturb `TestAntccFixture`. Its assistant records span **2026-05-09 .. 05-17**,
-one per a few representative days, to exercise the `days_back` date-window
-filtering — which the other fixtures deliberately bypass by scanning with an
-unbounded window.
-
-`TestAntccWindowCrosscheck` patches `watcher._utcnow` to a frozen **2026-05-17**
-so `days_back=7` covers 2026-05-10..05-17; the 2026-05-09 record sits one day
-outside and must be dropped. It then runs the antcc crosscheck (collector vs. an
-independent manual dedup scan) hermetically — no live `ANTCC_DATA_DIR` and no
-ccusage needed, since antcc is parsed in-process — and also asserts hardcoded
-in-window totals so the boundary exclusion and the 05-10 streaming-dedup are
-both verified. The live-data `TestAntccCrosscheck` still skips without real
-data; this is its always-on hermetic counterpart.
-
 ## `.gemini/antigravity-cli/`
 
 A sanitized, **partial** slice of a real Antigravity CLI (`agy`)
@@ -116,4 +82,4 @@ Conversation content, thinking, and tool calls are redacted. One conversation
 includes a duplicate `step_index` update to exercise per-step deduplication
 (last snapshot wins), and a second conversation exercises a different project,
 model, and `cache_creation_tokens`. Fixed dates are scanned with an unbounded
-`days_back`, matching `.codex/` and `.codefuse/`.
+`days_back`, matching `.codex/` and `.codefuse/engine/codex/`.

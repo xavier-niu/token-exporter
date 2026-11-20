@@ -142,7 +142,7 @@ the calendar moves — do **not** "fix" it by switching to recent dates.
 
 ## 7. Other agents
 
-Claude Code, AntCodex, and AntCC fixtures are committed alongside `.codex`.
+Claude Code and AntCodex fixtures are committed alongside `.codex`.
 Build or refresh Ant fixtures the same way: **only from real data**, on an env
 that has them. Don't fabricate.
 
@@ -157,47 +157,6 @@ at `.codefuse/engine/codex`.
 The committed fixture is a sanitized real session with the source metadata kept
 as-is, empty token-count events, duplicate cumulative snapshots, and redacted
 conversation payloads. Its expected totals live in `TestAntcodexFixture`.
-
-### antcc (`~/.codefuse/engine/cc`) — committed at `../.codefuse/engine/cc/`
-
-Different format and parser (`_scan_antcc_dir`) — it's the Claude-Code-style
-conversation JSONL, deduped by message id. Layout:
-
-```
-.codefuse/engine/cc/projects/<project-key>/**/*.jsonl
-```
-
-`<project-key>` is the directory name, dash-encoded like ccusage's
-`-home-nxw-developer-<project>`; `_extract_project` strips the first three
-dash-segments to get the project label. The parser reads, per line:
-
-| Field                                          | Purpose                                  |
-| ---------------------------------------------- | ---------------------------------------- |
-| `message.usage.input_tokens`                   | input                                    |
-| `message.usage.output_tokens`                  | output                                   |
-| `message.usage.cache_creation_input_tokens`    | cache creation                           |
-| `message.usage.cache_read_input_tokens`        | cache read                               |
-| `message.id`                                   | dedup key (see below)                    |
-| `message.model`                                | model                                    |
-| `timestamp`                                    | date bucket (in the run timezone)        |
-
-Lines with no `message.usage` (or all-zero tokens) are skipped. Detection keys
-off the directory **basename**: `cc` or `(.)codefuse` → `antcc`.
-
-**Dedup to exercise:** records sharing a `message.id` are treated as streaming
-updates to the *same* message — the parser subtracts the previous values and
-adds the new ones, so the final value for that id wins (not the sum). Author at
-least two lines with the same `message.id` and increasing usage, and assert the
-total reflects only the last one. (This is the bug the parser exists to fix:
-antcc leaves `requestId` absent or empty, so ccusage itself double-counts —
-https://github.com/ryoppippi/ccusage/issues/976.) AntCC cost comes from the
-shared pricing table when rates are available; unknown models still price as
-`0`. GLM text models are fetched from Z.ai's official pricing page, with
-bundled Z.ai rates only as a last-resort fallback when the page is unavailable.
-
-The committed fixture is a sanitized real streaming assistant response with the
-source metadata kept as-is. Three records share one `message.id` and omit
-`requestId`. Its expected totals live in `TestAntccFixture`.
 
 ### Claude Code (`~/.claude`)  — committed at `../.claude/`
 

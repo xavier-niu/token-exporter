@@ -18,7 +18,6 @@ from watcher import AgyCollector, CcusageCollector, CodexCollector
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 CODEX_FIXTURE_DIR = FIXTURES_DIR / ".codex"
 CODEFUSE_FIXTURE_DIR = FIXTURES_DIR / ".codefuse" / "engine"
-ANTCC_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "cc"
 ANTCODEX_FIXTURE_DIR = CODEFUSE_FIXTURE_DIR / "codex"
 AGY_FIXTURE_DIR = FIXTURES_DIR / ".gemini" / "antigravity-cli"
 # Fixtures carry fixed dates; scan with an effectively unbounded window so the
@@ -214,48 +213,6 @@ class TestCcusageCollector(unittest.TestCase):
         assert records[2][1]["cost_usd"] == pytest.approx(0.005)
 
     @patch("watcher.os.path.isdir", return_value=True)
-    @patch("watcher._scan_antcc_dir")
-    def test_antcc_incremental_rescan_emits_only_delta_cost(self, mock_scan, mock_isdir):
-        first = {
-            "projects": {
-                "-home-nxw-developer-token-exporter": [
-                    {
-                        "date": _DAY1_STR,
-                        "modelBreakdowns": [
-                            {
-                                "modelName": "GLM-5.2",
-                                "inputTokens": 100,
-                                "outputTokens": 0,
-                                "cacheCreationTokens": 0,
-                                "cacheReadTokens": 0,
-                                "cost": 0.001,
-                            }
-                        ],
-                    }
-                ]
-            }
-        }
-        second = json.loads(json.dumps(first))
-        second["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["inputTokens"] = 150
-        second["projects"]["-home-nxw-developer-token-exporter"][0]["modelBreakdowns"][0]["cost"] = 0.0015
-        mock_scan.side_effect = [first, second]
-
-        records = []
-        collector = CcusageCollector(
-            claude_dirs=["/fake/cc"],
-            days_back=7,
-            on_record=lambda agent, rec: records.append((agent, rec)),
-            pricing_rates={"zai/glm-5.2": {"input": 10, "cached": 0, "output": 0, "cache_creation": 0}},
-        )
-
-        collector.scan_history()
-        collector.scan_history()
-
-        assert [rec["input_tokens"] for _, rec in records] == [100, 50]
-        assert records[0][1]["cost_usd"] == pytest.approx(0.001)
-        assert records[1][1]["cost_usd"] == pytest.approx(0.0005)
-
-    @patch("watcher.os.path.isdir", return_value=True)
     @patch("watcher._run_ccusage")
     def test_collector_state_persists_cost_totals(self, mock_run, mock_isdir):
         mock_run.return_value = SAMPLE_CCUSAGE_INSTANCES
@@ -368,65 +325,6 @@ class TestCcusageCollector(unittest.TestCase):
         )
         collector.scan_history()
         assert len(records) == 0
-
-
-class TestAntccFixture(unittest.TestCase):
-    """Parse the committed, sanitized real-world AntCC fixture end-to-end."""
-
-    def _collect(self, pricing_rates=None):
-        records = []
-        collector = CcusageCollector(
-            claude_dirs=[str(ANTCC_FIXTURE_DIR)],
-            days_back=UNBOUNDED_DAYS_BACK,
-            on_record=lambda agent, rec: records.append((agent, rec)),
-            pricing_rates=pricing_rates,
-        )
-        collector.scan_history()
-        return records
-
-    def test_streaming_message_updates_are_deduped(self):
-        records = self._collect()
-
-        assert len(records) == 1
-        agent, rec = records[0]
-        assert agent == "antcc"
-        assert rec["project"] == "transfer"
-        assert rec["model"] == "claude-opus-4-6"
-        # Three real streaming updates share one message id; only the last wins.
-        assert rec["input_tokens"] == 3
-        assert rec["output_tokens"] == 355
-        assert rec["cache_creation_tokens"] == 4677
-        assert rec["cache_read_tokens"] == 20851
-        assert rec["cost_usd"] == 0
-        assert rec["timestamp"].date().isoformat() == "2026-04-14"
-
-    def test_fixture_preserves_missing_request_id(self):
-        fixture_file = (
-            ANTCC_FIXTURE_DIR
-            / "projects"
-            / "-home-nxw-developer-transfer"
-            / "4ddb168d-9741-4794-9318-72edd668ad79.jsonl"
-        )
-        rows = [json.loads(line) for line in fixture_file.read_text().splitlines()]
-        usage_rows = [row for row in rows if (row.get("message") or {}).get("usage")]
-
-        assert len({row["message"]["id"] for row in usage_rows}) == 1
-        assert all("requestId" not in row for row in usage_rows)
-
-    def test_applies_litellm_pricing_to_fixture(self):
-        rates = {
-            "claude-opus-4-6": {
-                "input": 1.0,
-                "cached": 0.1,
-                "output": 2.0,
-                "cache_creation": 0.5,
-            }
-        }
-        records = self._collect(pricing_rates=rates)
-        _, rec = records[0]
-        assert rec["cost_usd"] == pytest.approx(
-            (3 * 1.0 + 20851 * 0.1 + 355 * 2.0 + 4677 * 0.5) / 1e6
-        )
 
 
 class TestCodexCollector(unittest.TestCase):
@@ -876,15 +774,6 @@ def _ccusage_report(project_key, tokens):
     }]}}
 
 
-def _antcc_line(msg_id, tokens, day=_DAY1):
-    return json.dumps({
-        "type": "assistant",
-        "cwd": "/work/demo",
-        "timestamp": f"{day.isoformat()}T12:00:00.000Z",
-        "message": {"id": msg_id, "model": "m", "usage": {"input_tokens": tokens}},
-    }) + "\n"
-
-
 class TestUnchangedRootsAreNotRescanned:
     """An idle poll must cost a stat per file and never under- or over-count."""
 
@@ -1004,36 +893,38 @@ class TestUnchangedRootsAreNotRescanned:
         assert [r["input_tokens"] for r in records] == [100, 50]
 
     def test_window_change_rescans_without_replaying_days_that_left_it(self, tmp_path):
-        root = tmp_path / ".codefuse" / "engine" / "cc"
-        session = root / "projects" / "-work-demo" / "session.jsonl"
-        session.parent.mkdir(parents=True)
-        session.write_text(_antcc_line("old", 100, _DAY1))
-        collector, records = self._collector(str(root), days_back=7)
+        root, _ = _claude_root(tmp_path, "a")
+        collector, records = self._collector(root, days_back=7)
+
+        def ccusage(_root, since, *_):
+            return _ccusage_report(self.KEY, 100) if since <= _DAY1 else {"projects": {}}
+
         start = datetime.combine(_DAY1, datetime.min.time(), timezone.utc)
-        with patch("watcher._utcnow", return_value=start):
-            collector.check_updates()
-        assert [r["input_tokens"] for r in records] == [100]
-        # _DAY1's cursor gets pruned now, so reusing the cached scan would re-emit it.
-        with patch("watcher._utcnow", return_value=start + timedelta(days=8)):
-            collector.check_updates()
-            collector.check_updates()
+        with patch("watcher._run_ccusage", side_effect=ccusage):
+            with patch("watcher._utcnow", return_value=start):
+                collector.check_updates()
+            assert [r["input_tokens"] for r in records] == [100]
+            # _DAY1's cursor gets pruned now, so reusing the cached scan would re-emit it.
+            with patch("watcher._utcnow", return_value=start + timedelta(days=8)):
+                collector.check_updates()
+                collector.check_updates()
         assert [r["input_tokens"] for r in records] == [100]
 
-    def test_unchanged_antcc_root_is_not_reparsed_and_append_counts_once(self, tmp_path):
-        root = tmp_path / ".codefuse" / "engine" / "cc"
-        session = root / "projects" / "-work-demo" / "session.jsonl"
-        session.parent.mkdir(parents=True)
-        session.write_text(_antcc_line("one", 100))
-        collector, records = self._collector(str(root))
-        with patch("watcher._scan_antcc_dir", wraps=watcher._scan_antcc_dir) as scan:
+    def test_antcc_root_is_skipped_with_a_warning(self, tmp_path, caplog):
+        antcc = tmp_path / ".codefuse" / "engine" / "cc"
+        (antcc / "projects" / self.KEY).mkdir(parents=True)
+        root, _ = _claude_root(tmp_path, "a")
+        with caplog.at_level("WARNING", logger="token-stats"):
+            collector, records = self._collector(str(antcc), root)
+        assert [r.getMessage() for r in caplog.records] == [
+            f"Ignoring {antcc}: AntCC is no longer supported"
+        ]
+        with patch("watcher._run_ccusage", return_value=_ccusage_report(self.KEY, 100)) as run:
             collector.check_updates()
             collector.check_updates()
-            assert scan.call_count == 1
-            _append(session, _antcc_line("two", 40))
-            collector.check_updates()
-            collector.check_updates()
-            assert scan.call_count == 2
-        assert [r["input_tokens"] for r in records] == [100, 40]
+        # ccusage would count each streamed AntCC update, so it never sees that root.
+        assert [call.args[0] for call in run.call_args_list] == [root]
+        assert [(r["project"], r["input_tokens"]) for r in records] == [("demo", 100)]
 
     def test_unresolved_project_is_not_reread_until_its_metadata_changes(self, tmp_path):
         root = tmp_path / ".claude"

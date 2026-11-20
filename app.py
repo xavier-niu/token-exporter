@@ -298,7 +298,7 @@ def main():
             timezone_name=config["timezone"],
             pricing_rates=pricing_rates,
         )
-        _initial_scan(cc_collector, "Claude Code / AntCC")
+        _initial_scan(cc_collector, "Claude Code")
         collectors.append(cc_collector)
 
     if config["codex_dirs"]:

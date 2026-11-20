@@ -39,6 +39,8 @@ def _detect_agent(base_dir: str) -> str:
     if "/codex" in base_dir:
         return "antcodex"
     base = os.path.basename(os.path.normpath(base_dir))
+    # AntCC is no longer collected; it is still recognized so that a configured
+    # AntCC directory is skipped rather than scanned as Claude Code.
     if base.lower() == "cc":
         return "antcc"
     if base.lower() in ("codefuse", ".codefuse"):
@@ -71,140 +73,6 @@ def _run_ccusage(claude_dir: str, since: date, timezone_name: str = "UTC") -> di
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
         logger.error("ccusage error for %s: %s", claude_dir, e)
         return None
-
-
-def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> dict:
-    """Scan AntCC JSONL files directly with msg_id dedup.
-
-    AntCC records have empty requestId, so ccusage doesn't dedup them
-    (https://github.com/ryoppippi/ccusage/issues/976). This parser
-    deduplicates by msg_id to produce correct counts.
-
-    Cost is left at 0 here; it is priced from the shared pricing table by
-    _process_ccusage_data (on the per-poll token delta), so computing it on the
-    cumulative totals here would just be thrown away.
-
-    Returns dict in ccusage --instances format:
-    {"projects": {"-home-...": [{"date": "...", "modelBreakdowns": [...]}]}}
-    """
-    tz = ZoneInfo(timezone_name)
-    since_local = since.strftime("%Y-%m-%d")
-    projects_dir = os.path.join(base_dir, "projects")
-
-    # Aggregate per (project_key, date, model) with dedup by msg_id
-    # {project_key: {date: {model: {"input": N, "output": N, ...}}}}
-    agg: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
-    # Per-msg_id token values for dedup:
-    # {project_key: {date: {msg_id: {"input": N, ...}}}}
-    msg_values: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
-
-    for project_dir in Path(projects_dir).iterdir():
-        if not project_dir.is_dir():
-            continue
-        project_key = project_dir.name
-        agg[project_key] = {}
-        msg_values[project_key] = {}
-
-        for jsonl_file in project_dir.rglob("*.jsonl"):
-            try:
-                with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        usage = obj.get("message", {}).get("usage")
-                        if not usage:
-                            continue
-
-                        msg_id = obj.get("message", {}).get("id", "")
-                        ts_str = obj.get("timestamp", "")
-                        if not ts_str:
-                            continue
-
-                        try:
-                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        except (ValueError, TypeError):
-                            continue
-
-                        local_ts = ts.astimezone(tz)
-                        date_str = local_ts.strftime("%Y-%m-%d")
-                        if date_str < since_local:
-                            continue
-
-                        model = obj.get("message", {}).get("model", "unknown") or "unknown"
-                        input_tokens = usage.get("input_tokens", 0) or 0
-                        output_tokens = usage.get("output_tokens", 0) or 0
-                        cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-                        cache_read = usage.get("cache_read_input_tokens", 0) or 0
-
-                        if not input_tokens and not output_tokens and not cache_creation and not cache_read:
-                            continue
-
-                        date_agg = agg[project_key].setdefault(date_str, {})
-                        if model not in date_agg:
-                            date_agg[model] = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
-                        m = date_agg[model]
-
-                        # Dedup by msg_id: subtract old values, add new (streaming updates)
-                        if msg_id:
-                            date_msgs = msg_values[project_key].setdefault(date_str, {})
-                            old = date_msgs.get(msg_id)
-                            if old:
-                                m["input"] -= old["input"]
-                                m["output"] -= old["output"]
-                                m["cache_creation"] -= old["cache_creation"]
-                                m["cache_read"] -= old["cache_read"]
-                            date_msgs[msg_id] = {"input": input_tokens, "output": output_tokens, "cache_creation": cache_creation, "cache_read": cache_read}
-
-                        m["input"] += input_tokens
-                        m["output"] += output_tokens
-                        m["cache_creation"] += cache_creation
-                        m["cache_read"] += cache_read
-            except OSError:
-                continue
-
-    # Convert to ccusage --instances format
-    result: dict[str, list] = {"projects": {}}
-    for project_key, dates in sorted(agg.items()):
-        entries = []
-        for date_str, models in sorted(dates.items()):
-            breakdowns = []
-            for model, tokens in sorted(models.items()):
-                breakdowns.append({
-                    "modelName": model,
-                    "inputTokens": tokens["input"],
-                    "outputTokens": tokens["output"],
-                    "cacheCreationTokens": tokens["cache_creation"],
-                    "cacheReadTokens": tokens["cache_read"],
-                    "cost": 0,
-                })
-            entries.append({
-                "date": date_str,
-                "inputTokens": sum(b["inputTokens"] for b in breakdowns),
-                "outputTokens": sum(b["outputTokens"] for b in breakdowns),
-                "cacheCreationTokens": sum(b["cacheCreationTokens"] for b in breakdowns),
-                "cacheReadTokens": sum(b["cacheReadTokens"] for b in breakdowns),
-                "totalTokens": sum(
-                    b["inputTokens"]
-                    + b["outputTokens"]
-                    + b["cacheCreationTokens"]
-                    + b["cacheReadTokens"]
-                    for b in breakdowns
-                ),
-                # No cost here: antcc is priced from the token delta in
-                # _process_ccusage_data, so a cumulative cost would be discarded.
-                "totalCost": 0,
-                "modelsUsed": [b["modelName"] for b in breakdowns],
-                "modelBreakdowns": breakdowns,
-            })
-        if entries:
-            result["projects"][project_key] = entries
-    return result
 
 
 # Token fields to track for delta computation
@@ -600,7 +468,7 @@ def _process_ccusage_data(
         last_totals[key] = {
             field: max(value, (last or {}).get(field, 0))
             for field, value in current.items()
-        } if agent in ('cc', 'antcc') else current
+        } if agent == 'cc' else current
 
         has_delta = any(delta.get(f, 0) > 0 for f in _TOKEN_FIELDS)
         if not has_delta:
@@ -736,15 +604,12 @@ class _BaseCollector:
 
 
 class CcusageCollector(_BaseCollector):
-    """Collects token usage from Claude Code / AntCC data directories.
+    """Collects token usage from Claude Code data directories via the ccusage CLI.
 
-    Uses ccusage CLI for Claude Code (cc) directories and inline JSONL
-    parsing with msg_id dedup for AntCC directories (ccusage doesn't
-    dedup when requestId is empty). Costs for both paths are computed
-    in-process from token deltas via the shared pricing map, so they stay
-    correct as rates change without depending on ccusage's bundled offline
-    pricing snapshot; ccusage's own cost is used only as a fallback for a
-    model the pricing map doesn't yet know.
+    Costs are computed in-process from token deltas via the shared pricing
+    map, so they stay correct as rates change without depending on ccusage's
+    bundled offline pricing snapshot; ccusage's own cost is used only as a
+    fallback for a model the pricing map doesn't yet know.
     """
 
     def __init__(
@@ -756,23 +621,25 @@ class CcusageCollector(_BaseCollector):
         timezone_name: str = "UTC",
         pricing_rates: dict | None = None,
     ):
-        super().__init__(claude_dirs, days_back, on_record, state_file,
-                         timezone_name, pricing_rates)
+        # AntCC logs leave requestId empty, so ccusage would count every
+        # streamed update of a message: skip them rather than miscount.
+        retired = [d for d in claude_dirs if _detect_agent(d) == "antcc"]
+        for claude_dir in retired:
+            logger.warning("Ignoring %s: AntCC is no longer supported", claude_dir)
+        super().__init__([d for d in claude_dirs if d not in retired], days_back,
+                         on_record, state_file, timezone_name, pricing_rates)
         self.project_resolver = ClaudeProjectResolver()
 
-    def _scan_claude_root(self, claude_dir, agent, since):
+    def _scan_claude_root(self, claude_dir, since):
         """Scan one root and key its result by project name; None if the scan failed.
 
         Names are resolved here so that a cached result also spares re-reading the
         logs of a project whose cwd is unknown. Everything the resolver reads is
         part of the root's signature, so it is retried as soon as that can help.
         """
-        if agent == "antcc":
-            data = _scan_antcc_dir(claude_dir, since, self.timezone_name)
-        else:
-            data = _run_ccusage(claude_dir, since, self.timezone_name)
-            if data is None:
-                return None
+        data = _run_ccusage(claude_dir, since, self.timezone_name)
+        if data is None:
+            return None
         projects = {}
         for key, entries in data.get("projects", {}).items():
             name = self.project_resolver.resolve(claude_dir, key)
@@ -795,7 +662,7 @@ class CcusageCollector(_BaseCollector):
             agent = _detect_agent(claude_dir)
             data = self._scan_root(
                 claude_dir, projects_dir, (since,),
-                lambda: self._scan_claude_root(claude_dir, agent, since),
+                lambda: self._scan_claude_root(claude_dir, since),
             )
             if data is None:
                 failed_agents.add(agent)
