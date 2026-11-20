@@ -80,6 +80,17 @@ def _persist_all(collectors: list, counter_state_file: str) -> None:
         save_state(counter_state_file)
 
 
+def _initial_scan(collector, label: str) -> None:
+    """Run a collector's startup scan; if it fails, the poll loop retries it."""
+    logger.info("Scanning %s history...", label)
+    try:
+        collector.scan_history()
+    except Exception:
+        logger.exception("%s scan failed; retrying next poll", label)
+    else:
+        logger.info("%s scan complete", label)
+
+
 def poll_loop(collectors: list, interval: int, persist_interval: int,
               counter_state_file: str, next_persist: float | None = None):
     """Scan every `interval` so metrics stay fresh, but flush to disk only every
@@ -91,7 +102,12 @@ def poll_loop(collectors: list, interval: int, persist_interval: int,
     if next_persist is None:
         next_persist = now + persist_interval
     for collector in collectors:
-        collector.check_updates()
+        # One collector's failure must not end this timer chain, which would
+        # stop every collector updating until a restart.
+        try:
+            collector.check_updates()
+        except Exception:
+            logger.exception("%s update failed; retrying next poll", type(collector).__name__)
     if now >= next_persist:
         _persist_all(collectors, counter_state_file)
         next_persist = now + persist_interval
@@ -280,9 +296,7 @@ def main():
             timezone_name=config["timezone"],
             pricing_rates=pricing_rates,
         )
-        logger.info("Scanning Claude Code / AntCC history...")
-        cc_collector.scan_history()
-        logger.info("Claude Code / AntCC scan complete")
+        _initial_scan(cc_collector, "Claude Code / AntCC")
         collectors.append(cc_collector)
 
     if config["codex_dirs"]:
@@ -294,9 +308,7 @@ def main():
             timezone_name=config["timezone"],
             pricing_rates=pricing_rates,
         )
-        logger.info("Scanning Codex history...")
-        codex_collector.scan_history()
-        logger.info("Codex scan complete")
+        _initial_scan(codex_collector, "Codex")
         collectors.append(codex_collector)
 
     if counter_state_file:

@@ -212,3 +212,23 @@ def test_metrics_server_answers_immediately_despite_the_long_idle_poll():
     with urllib.request.urlopen(url, timeout=5) as response:
         assert response.status == 200
         assert b"# TYPE" in response.read()
+
+
+def test_a_failing_collector_does_not_stop_the_poll_loop(monkeypatch):
+    timers = []
+    monkeypatch.setattr(app.threading, "Timer", lambda *args, **kwargs: timers.append(args) or MagicMock())
+    broken = MagicMock()
+    broken.check_updates.side_effect = UnicodeDecodeError("utf-8", b"\xe4", 0, 1, "unexpected end of data")
+    healthy = MagicMock()
+
+    app.poll_loop([broken, healthy], interval=60, persist_interval=600, counter_state_file="")
+
+    healthy.check_updates.assert_called_once()
+    assert len(timers) == 1  # The next poll is still scheduled.
+
+
+def test_a_failing_startup_scan_is_left_to_the_poll_loop():
+    broken = MagicMock()
+    broken.scan_history.side_effect = PermissionError("denied")
+    app._initial_scan(broken, "Antigravity CLI")
+    broken.scan_history.assert_called_once()
