@@ -101,7 +101,7 @@ def _scan_antcc_dir(base_dir: str, since: date, timezone_name: str = "UTC") -> d
 
         for jsonl_file in project_dir.rglob("*.jsonl"):
             try:
-                with open(jsonl_file, "r") as f:
+                with open(jsonl_file, "r", encoding="utf-8", errors="replace") as f:
                     for line in f:
                         line = line.strip()
                         if not line:
@@ -337,7 +337,8 @@ def _parse_codex_session_file(
     previous: dict[str, int] | None = None
 
     try:
-        with open(session_file, "r") as f:
+        # errors="replace": a final line cut mid-character is skipped as bad JSON.
+        with open(session_file, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     obj = json.loads(line)
